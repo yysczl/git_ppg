@@ -19,7 +19,7 @@ set_seed(42)
 # 主函数
 def main():
     # 文件路径
-    file_path = "c:\\Users\\12991\\Desktop\\ppg-code\\regression_dataset\\PRV\\StressPRV.csv"
+    file_path = "../dataset/PRV/StressPRV.csv"
     
     # 检查文件是否存在
     if not os.path.exists(file_path):
@@ -40,7 +40,7 @@ def main():
     print(f"使用设备: {device}")
     
     # 定义模型类型和参数
-    model_type = "BiLSTM"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
+    model_type = "Informer"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
     
     # 根据模型类型设置模型参数
     if model_type == "Informer":
@@ -141,7 +141,7 @@ def main():
     avg_train_rmses = np.mean(all_losses[4], axis=0)
     avg_val_rmses = np.mean(all_losses[5], axis=0)
     
-    plot_training_process(avg_train_losses, avg_val_losses, avg_train_maes, avg_val_maes, avg_train_rmses, avg_val_rmses)
+    plot_training_process(avg_train_losses, avg_val_losses, avg_train_maes, avg_val_maes, avg_train_rmses, avg_val_rmses, model_type, "prv")
 
     # 选择验证集表现最好的模型
     best_fold_index = np.argmin([result['val_loss'] for result in fold_results])
@@ -160,7 +160,7 @@ def main():
     )
     
     # 绘制预测结果
-    plot_predictions(predictions, targets)
+    plot_predictions(predictions, targets, model_type, "prv")
     
     print("模型训练和评估完成!")
     print(f"测试集 - Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
@@ -186,7 +186,7 @@ def main():
     )
     
     # 保存最终模型
-    model_save_path = f"final_{model_type}_model.pth"
+    model_save_path = f"prv_{model_type}_model.pth"
     torch.save(final_model, model_save_path)
     print(f"最终模型已保存到: {model_save_path}")
     

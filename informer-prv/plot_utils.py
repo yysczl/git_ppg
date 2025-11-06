@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 
 # 绘制训练过程
-def plot_training_process(train_losses, val_losses, train_maes, val_maes, train_rmses, val_rmses):
+def plot_training_process(train_losses, val_losses, train_maes, val_maes, train_rmses, val_rmses, model_type, signal_type):
     plt.figure(figsize=(15, 5))
     
     # 绘制损失
@@ -32,16 +32,16 @@ def plot_training_process(train_losses, val_losses, train_maes, val_maes, train_
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('training_process.png')
+    plt.savefig(f'{signal_type}_{model_type}_training_process.png')
     plt.show()
 
 # 绘制预测结果
-def plot_predictions(predictions, targets):
+def plot_predictions(predictions, targets, model_type, signal_type):
     plt.figure(figsize=(10, 6))
     plt.scatter(targets, predictions, alpha=0.5)
     plt.plot([min(targets), max(targets)], [min(targets), max(targets)], 'r--')
     plt.xlabel('True Values')
     plt.ylabel('Predictions')
     plt.title('Predictions vs. True Values')
-    plt.savefig('predictions.png')
+    plt.savefig(f'{signal_type}_{model_type}_predictions.png')
     plt.show()

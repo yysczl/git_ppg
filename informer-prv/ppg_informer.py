@@ -141,7 +141,7 @@ def main():
     avg_train_rmses = np.mean(all_losses[4], axis=0)
     avg_val_rmses = np.mean(all_losses[5], axis=0)
     
-    plot_training_process(avg_train_losses, avg_val_losses, avg_train_maes, avg_val_maes, avg_train_rmses, avg_val_rmses)
+    plot_training_process(avg_train_losses, avg_val_losses, avg_train_maes, avg_val_maes, avg_train_rmses, avg_val_rmses, model_type, "ppg")
 
     # 选择验证集表现最好的模型
     best_fold_index = np.argmin([result['val_loss'] for result in fold_results])
@@ -160,7 +160,7 @@ def main():
     )
     
     # 绘制预测结果
-    plot_predictions(predictions, targets)
+    plot_predictions(predictions, targets, model_type, "ppg")
     
     print("模型训练和评估完成!")
     print(f"测试集 - Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
@@ -186,7 +186,7 @@ def main():
     )
     
     # 保存最终模型
-    model_save_path = f"final_{model_type}_model.pth"
+    model_save_path = f"ppg_{model_type}_model.pth"
     torch.save(final_model, model_save_path)
     print(f"最终模型已保存到: {model_save_path}")
     
