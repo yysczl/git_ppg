@@ -40,7 +40,7 @@ def main():
     print(f"使用设备: {device}")
     
     # 定义模型类型和参数
-    model_type = "Informer"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
+    model_type = "LSTM"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
     
     # 根据模型类型设置模型参数
     if model_type == "Informer":
@@ -119,7 +119,7 @@ def main():
     
     # K折交叉验证训练
     k_folds = 5
-    num_epochs = 500
+    num_epochs = 100
     batch_size = 8
     
     fold_results, all_losses, best_model_states = train_model_kfold(
@@ -143,24 +143,66 @@ def main():
     
     plot_training_process(avg_train_losses, avg_val_losses, avg_train_maes, avg_val_maes, avg_train_rmses, avg_val_rmses, model_type, "prv")
 
-    # 选择验证集表现最好的模型
-    best_fold_index = np.argmin([result['val_loss'] for result in fold_results])
-    print(f"选择第 {best_fold_index+1} 折的模型作为最佳模型")
-    best_model = model_class(**model_params)
-    best_model.load_state_dict(best_model_states[best_fold_index])
-    best_model.to(device)
-    
+    # 使用所有折的模型进行集成预测，而不是选择单折中表现最好的模型
+    print("使用所有折的模型进行集成预测...")
     # 创建测试数据加载器
     test_dataset = PRVDataset(X_test, y_test)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
-    # 评估模型
-    test_loss, test_mae, test_rmse, predictions, targets = evaluate_model(
-        best_model, test_loader, criterion, device
-    )
+    # 加载所有折的模型
+    ensemble_models = []
+    for i, model_state in enumerate(best_model_states):
+        model = model_class(**model_params)
+        model.load_state_dict(model_state)
+        model.to(device)
+        model.eval()
+        ensemble_models.append(model)
+    
+    # 评估集成模型
+    ensemble_predictions = []
+    targets = []
+    
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            batch_size, seq_len = data.shape
+            
+            # 收集所有模型的预测结果
+            fold_predictions = []
+            for model in ensemble_models:
+                if hasattr(model, 'forward') and 'tgt' in model.forward.__code__.co_varnames:
+                    # 对于Informer模型
+                    tgt = torch.zeros(batch_size, 1, 1).to(device)
+                    data_input = data.unsqueeze(-1)
+                    output = model(data_input, tgt)
+                else:
+                    # 对于其他模型
+                    data_input = data.unsqueeze(-1)
+                    output = model(data_input)
+                
+                fold_predictions.append(output.squeeze())
+            
+            # 计算所有模型预测的平均值
+            avg_prediction = torch.mean(torch.stack(fold_predictions), dim=0)
+            
+            # 处理可能的0维张量情况
+            if avg_prediction.dim() == 0:  # 如果是0维张量
+                ensemble_predictions.append(avg_prediction.item())
+                targets.append(target.squeeze().item())
+            else:  # 如果是1维张量
+                ensemble_predictions.extend(avg_prediction.cpu().numpy())
+                targets.extend(target.squeeze().cpu().numpy())
+    
+    # 计算集成模型的评估指标
+    ensemble_predictions = np.array(ensemble_predictions)
+    targets = np.array(targets)
+    
+    test_loss = np.mean((ensemble_predictions - targets) ** 2)
+    test_mae = np.mean(np.abs(ensemble_predictions - targets))
+    test_rmse = np.sqrt(test_loss)
     
     # 绘制预测结果
-    plot_predictions(predictions, targets, model_type, "prv")
+    plot_predictions(ensemble_predictions, targets, model_type, "prv")
     
     print("模型训练和评估完成!")
     print(f"测试集 - Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")

@@ -16,8 +16,8 @@ set_seed(42)
 
 def main():
     # 文件路径
-    file_path = "c:\\Users\\12991\\Desktop\\ppg-code\\regression_dataset\\PRV\\StressPRV.csv"
-    model_path = "final_BiLSTM_model.pth"  # 根据实际保存的模型文件名进行修改
+    file_path = "../dataset/PRV/StressPRV.csv"
+    model_path = "prv_LSTM_model.pth"  # 根据实际保存的模型文件名进行修改
     
     # 检查文件是否存在
     if not os.path.exists(file_path):
@@ -58,7 +58,7 @@ def main():
     print(f"测试集 - Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
     
     # 绘制预测结果
-    plot_predictions(predictions, targets)
+    plot_predictions(predictions, targets, "LSTM", "prv")
     
     # 显示图形
     plt.show()
