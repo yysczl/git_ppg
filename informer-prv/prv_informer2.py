@@ -19,7 +19,7 @@ set_seed(42)
 # 主函数
 def main():
     # 文件路径
-    file_path = "../dataset/PRV/StressPRV.csv"
+    file_path = "../dataset/PRV/PeacePRV.csv"
     
     # 检查文件是否存在
     if not os.path.exists(file_path):
@@ -40,7 +40,7 @@ def main():
     print(f"使用设备: {device}")
     
     # 定义模型类型和参数
-    model_type = "LSTM"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
+    model_type = "Informer"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
     
     # 根据模型类型设置模型参数
     if model_type == "Informer":
@@ -118,8 +118,8 @@ def main():
     }
     
     # K折交叉验证训练
-    k_folds = 5
-    num_epochs = 100
+    k_folds = 3
+    num_epochs = 300
     batch_size = 8
     
     fold_results, all_losses, best_model_states = train_model_kfold(
@@ -207,39 +207,39 @@ def main():
     print("模型训练和评估完成!")
     print(f"测试集 - Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, RMSE: {test_rmse:.4f}")
     
-    # 训练用于部署的最终模型
-    print("\n开始训练用于部署的最终模型...")
-    
-    # 合并所有数据用于最终训练 (训练集 + 验证集 + 测试集)
-    X_full = np.concatenate([X_train, X_val], axis=0)
-    y_full = np.concatenate([y_train, y_val], axis=0)
-    
-    print(f"完整数据集大小: {X_full.shape}")
-    
-    # 使用与交叉验证相同的超参数训练最终模型
-    final_model, final_train_losses, final_train_maes, final_train_rmses = train_final_model(
-        X_full, y_full,
-        model_class, model_params,
-        criterion,
-        optimizer_class, optimizer_params,
-        num_epochs, device,
-        batch_size,
-        scheduler_class, scheduler_params
-    )
-    
-    # 保存最终模型
-    model_save_path = f"prv_{model_type}_model.pth"
-    torch.save(final_model, model_save_path)
-    print(f"最终模型已保存到: {model_save_path}")
-    
-    # 示例：加载保存的模型并重新评估测试集
-    print("\n示例：加载保存的模型并重新评估测试集...")
-    loaded_test_loss, loaded_test_mae, loaded_test_rmse, loaded_predictions, loaded_targets = load_and_evaluate_model(
-        model_save_path, test_loader, criterion, device
-    )
-    
-    print("加载模型评估结果:")
-    print(f"测试集 - Loss: {loaded_test_loss:.4f}, MAE: {loaded_test_mae:.4f}, RMSE: {loaded_test_rmse:.4f}")
+    # # 训练用于部署的最终模型
+    # print("\n开始训练用于部署的最终模型...")
+    #
+    # # 合并所有数据用于最终训练 (训练集 + 验证集 + 测试集)
+    # X_full = np.concatenate([X_train, X_val], axis=0)
+    # y_full = np.concatenate([y_train, y_val], axis=0)
+    #
+    # print(f"完整数据集大小: {X_full.shape}")
+    #
+    # # 使用与交叉验证相同的超参数训练最终模型
+    # final_model, final_train_losses, final_train_maes, final_train_rmses = train_final_model(
+    #     X_full, y_full,
+    #     model_class, model_params,
+    #     criterion,
+    #     optimizer_class, optimizer_params,
+    #     num_epochs, device,
+    #     batch_size,
+    #     scheduler_class, scheduler_params
+    # )
+    #
+    # # 保存最终模型
+    # model_save_path = f"prv_{model_type}_model.pth"
+    # torch.save(final_model, model_save_path)
+    # print(f"最终模型已保存到: {model_save_path}")
+    #
+    # # 示例：加载保存的模型并重新评估测试集
+    # print("\n示例：加载保存的模型并重新评估测试集...")
+    # loaded_test_loss, loaded_test_mae, loaded_test_rmse, loaded_predictions, loaded_targets = load_and_evaluate_model(
+    #     model_save_path, test_loader, criterion, device
+    # )
+    #
+    # print("加载模型评估结果:")
+    # print(f"测试集 - Loss: {loaded_test_loss:.4f}, MAE: {loaded_test_mae:.4f}, RMSE: {loaded_test_rmse:.4f}")
 
 if __name__ == "__main__":
     main()
