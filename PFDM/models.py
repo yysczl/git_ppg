@@ -706,7 +706,8 @@ class RegressionHead(nn.Module):
     """
     压力回归头
     
-    用于单任务压力回归，将特征维度转换为输出维度
+    用于单任务压力回归，简化实现：仅用单个线性层做维度转换
+    参考 informer-prv 的实现方式，直接输出预测值
     """
     
     def __init__(self, d_model: int, output_dim: int = 1, dropout: float = 0.1):
@@ -714,13 +715,8 @@ class RegressionHead(nn.Module):
         self.d_model = d_model
         self.output_dim = output_dim
         
-        # 回归层：将d_model维度转换为output_dim
-        self.regressor = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, output_dim)
-        )
+        # 简化回归层：仅做维度转换
+        self.fc = nn.Linear(d_model, output_dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -729,7 +725,7 @@ class RegressionHead(nn.Module):
         Returns:
             [batch_size, output_dim]
         """
-        return self.regressor(x)
+        return self.fc(x)
     
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """计算MSE损失"""
@@ -740,7 +736,8 @@ class ClassificationHead(nn.Module):
     """
     情绪分类头
     
-    用于单任务情绪分类，将特征维度转换为类别数
+    用于单任务情绪分类，简化实现：仅用单个线性层做维度转换
+    参考 informer-prv 的实现方式，直接输出分类 logits
     """
     
     def __init__(self, d_model: int, num_classes: int = 5, dropout: float = 0.1):
@@ -748,13 +745,8 @@ class ClassificationHead(nn.Module):
         self.d_model = d_model
         self.num_classes = num_classes
         
-        # 分类层：将d_model维度转换为num_classes
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, num_classes)
-        )
+        # 简化分类层：仅做维度转换
+        self.fc = nn.Linear(d_model, num_classes)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -763,10 +755,10 @@ class ClassificationHead(nn.Module):
         Returns:
             [batch_size, num_classes]
         """
-        return self.classifier(x)
+        return self.fc(x)
     
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """计算交叉熔损失"""
+        """计算交叉熵损失"""
         return F.cross_entropy(pred, target)
 
 

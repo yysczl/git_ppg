@@ -1,58 +1,120 @@
 """PPG-Former-DualStream 主程序入口
 融合多尺度时频Transformer与双流协同的多任务心理压力预测
 
-使用方法:
-    # 默认双流训练
+================================================================================
+使用方法
+================================================================================
+
+1. 双流模型训练
+--------------------------------------------------------------------------------
+    # 双流融合训练（PPG + PRV）
     python main.py --mode train --train_mode dual_stream
     
-    # PPG独立压力回归训练（使用全部情绪数据）
+    # PPG单流训练
+    python main.py --mode train --train_mode ppg_only
+    
+    # PRV单流训练
+    python main.py --mode train --train_mode prv_only
+
+2. 压力回归单任务训练
+--------------------------------------------------------------------------------
+    # PPG压力回归（使用全部情绪数据）
     python main.py --mode train --train_mode ppg_regression
     
-    # PPG压力回归训练（使用指定的Stress情绪类别数据）
-    python main.py --mode train --train_mode ppg_regression --target_emotion Stress
-    
-    # PRV压力回归训练（使用指定的Anxiety情绪类别数据）
-    python main.py --mode train --train_mode prv_regression --target_emotion Anxiety
-    
-    # PRV独立压力回归训练
+    # PRV压力回归（使用全部情绪数据）
     python main.py --mode train --train_mode prv_regression
     
-    # PPG情绪分类训练（自动使用全部5种情绪数据）
+    # 指定单一目标情绪类别训练
+    python main.py --mode train --train_mode ppg_regression --target_emotion Stress
+    python main.py --mode train --train_mode prv_regression --target_emotion Anxiety
+    
+    # 指定多个情绪类别训练
+    python main.py --mode train --train_mode ppg_regression --emotions Stress,Anxiety,Sad
+
+3. 情绪分类单任务训练（强制使用全部5种情绪数据）
+--------------------------------------------------------------------------------
+    # PPG情绪分类
     python main.py --mode train --train_mode ppg_classification
     
-    # PRV情绪分类训练（自动使用全部5种情绪数据）
+    # PRV情绪分类
     python main.py --mode train --train_mode prv_classification
-    
-    # 多任务训练（压力回归 + 情绪分类，自动使用全部5种情绪数据）
+
+4. 多任务训练（压力回归 + 情绪分类，强制使用全部5种情绪数据）
+--------------------------------------------------------------------------------
     python main.py --mode train --train_mode multi_task
+
+5. 基准模型训练（用于对比实验）
+--------------------------------------------------------------------------------
+    可选基准模型: lstm, gru, bilstm, tcn, transformer_baseline, informer
     
-    # 基准模型训练（四种单任务模式）
+    # 基准模型压力回归
     python main.py --mode train --train_mode baseline_ppg_regression --baseline_model lstm
     python main.py --mode train --train_mode baseline_prv_regression --baseline_model gru
+    python main.py --mode train --train_mode baseline_ppg_regression --baseline_model bilstm
+    python main.py --mode train --train_mode baseline_prv_regression --baseline_model tcn
+    
+    # 基准模型情绪分类
     python main.py --mode train --train_mode baseline_ppg_classification --baseline_model transformer_baseline
     python main.py --mode train --train_mode baseline_prv_classification --baseline_model informer
-    
-    # 消融实验
+
+6. 消融实验
+--------------------------------------------------------------------------------
+    # 自动运行所有消融配置
     python main.py --mode ablation
     
-    # 评估模式
+    # 手动禁用特定组件
+    python main.py --mode train --train_mode dual_stream --no_physiological_pe
+    python main.py --mode train --train_mode dual_stream --no_multi_scale_conv
+    python main.py --mode train --train_mode dual_stream --no_freq_attention
+    python main.py --mode train --train_mode dual_stream --no_stress_gating
+    python main.py --mode train --train_mode dual_stream --no_cross_modal
+    python main.py --mode train --train_mode dual_stream --no_uncertainty
+
+7. 模型评估
+--------------------------------------------------------------------------------
     python main.py --mode eval --model_path checkpoints/best_model.pth
+    python main.py --mode eval --model_path checkpoints/best_model.pth --train_mode ppg_regression
+
+8. 高级参数配置
+--------------------------------------------------------------------------------
+    # 指定配置文件
+    python main.py --mode train --config default
     
-    # 指定情绪类别训练（仅适用于压力回归任务）
-    python main.py --mode train --train_mode ppg_regression --emotions Stress,Anxiety
+    # 覆盖训练参数
+    python main.py --mode train --train_mode dual_stream --epochs 100 --batch_size 32 --lr 0.001
+    
+    # 指定设备和随机种子
+    python main.py --mode train --train_mode dual_stream --device cuda --seed 42
+    
+    # 自定义数据目录
+    python main.py --mode train --train_mode dual_stream --ppg_dir /path/to/ppg --prv_dir /path/to/prv
 
-训练模式说明:
-- 压力回归单任务 (ppg_regression/prv_regression):
-    可以通过 --target_emotion 参数指定使用特定情绪类别的数据进行训练
-    也可以通过 --emotions 参数指定多个情绪类别
-    默认使用全部5种情绪类别的数据
+================================================================================
+训练模式说明
+================================================================================
 
-- 情绪分类单任务 (ppg_classification/prv_classification):
-    强制使用全部5种情绪类别的数据，不支持指定情绪
-    --target_emotion 和 --emotions 参数将被忽略
+训练模式 (--train_mode):
+    ppg_only / prv_only       : 单流模型训练
+    dual_stream               : 双流融合模型训练
+    ppg_regression            : PPG压力回归单任务
+    prv_regression            : PRV压力回归单任务
+    ppg_classification        : PPG情绪分类单任务
+    prv_classification        : PRV情绪分类单任务
+    multi_task                : 多任务训练（压力回归+情绪分类）
+    baseline_ppg_regression   : 基准模型PPG压力回归
+    baseline_prv_regression   : 基准模型PRV压力回归
+    baseline_ppg_classification: 基准模型PPG情绪分类
+    baseline_prv_classification: 基准模型PRV情绪分类
 
-- 多任务训练 (multi_task):
-    强制使用全部5种情绪类别的数据
+情绪数据使用规则:
+    - 压力回归单任务: 可通过 --target_emotion 或 --emotions 指定情绪类别
+    - 情绪分类单任务: 强制使用全部5种情绪，忽略情绪选择参数
+    - 多任务训练: 强制使用全部5种情绪
+
+可用情绪类别: Anxiety, Happy, Peace, Sad, Stress
+
+可用基准模型 (--baseline_model):
+    lstm, gru, bilstm, tcn, transformer_baseline, informer
 """
 
 import os
