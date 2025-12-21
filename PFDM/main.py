@@ -1,34 +1,87 @@
-"""
-PPG-Former-DualStream 主程序入口
+"""PPG-Former-DualStream 主程序入口
 融合多尺度时频Transformer与双流协同的多任务心理压力预测
 
 使用方法:
-    python main.py                          # 使用默认配置训练
-    python main.py --config ppg_only        # 仅使用PPG模型训练
-    python main.py --config ablation_no_pe  # 消融实验：不使用生理周期位置编码
-    python main.py --mode eval --model_path checkpoints/best_model.pth  # 评估模式
+    # 默认双流训练
+    python main.py --mode train --train_mode dual_stream
+    
+    # PPG独立压力回归训练（使用全部情绪数据）
+    python main.py --mode train --train_mode ppg_regression
+    
+    # PPG压力回归训练（使用指定的Stress情绪类别数据）
+    python main.py --mode train --train_mode ppg_regression --target_emotion Stress
+    
+    # PRV压力回归训练（使用指定的Anxiety情绪类别数据）
+    python main.py --mode train --train_mode prv_regression --target_emotion Anxiety
+    
+    # PRV独立压力回归训练
+    python main.py --mode train --train_mode prv_regression
+    
+    # PPG情绪分类训练（自动使用全部5种情绪数据）
+    python main.py --mode train --train_mode ppg_classification
+    
+    # PRV情绪分类训练（自动使用全部5种情绪数据）
+    python main.py --mode train --train_mode prv_classification
+    
+    # 多任务训练（压力回归 + 情绪分类，自动使用全部5种情绪数据）
+    python main.py --mode train --train_mode multi_task
+    
+    # 基准模型训练（四种单任务模式）
+    python main.py --mode train --train_mode baseline_ppg_regression --baseline_model lstm
+    python main.py --mode train --train_mode baseline_prv_regression --baseline_model gru
+    python main.py --mode train --train_mode baseline_ppg_classification --baseline_model transformer_baseline
+    python main.py --mode train --train_mode baseline_prv_classification --baseline_model informer
+    
+    # 消融实验
+    python main.py --mode ablation
+    
+    # 评估模式
+    python main.py --mode eval --model_path checkpoints/best_model.pth
+    
+    # 指定情绪类别训练（仅适用于压力回归任务）
+    python main.py --mode train --train_mode ppg_regression --emotions Stress,Anxiety
+
+训练模式说明:
+- 压力回归单任务 (ppg_regression/prv_regression):
+    可以通过 --target_emotion 参数指定使用特定情绪类别的数据进行训练
+    也可以通过 --emotions 参数指定多个情绪类别
+    默认使用全部5种情绪类别的数据
+
+- 情绪分类单任务 (ppg_classification/prv_classification):
+    强制使用全部5种情绪类别的数据，不支持指定情绪
+    --target_emotion 和 --emotions 参数将被忽略
+
+- 多任务训练 (multi_task):
+    强制使用全部5种情绪类别的数据
 """
 
 import os
 import sys
 import argparse
 from datetime import datetime
+from typing import List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 # 导入项目模块
-from config import get_config, ExperimentConfig
+from config import (
+    get_config, list_available_configs, ExperimentConfig,
+    TrainMode, TaskType, list_baseline_models, AVAILABLE_BASELINE_MODELS
+)
 from models import (
-    PPGFormer, PPGFormerDualStream, DualStreamOnly,
-    LSTMBaseline, TransformerBaseline, create_model
+    PPGFormer, PRVModel, PPGFormerDualStream, DualStreamOnly,
+    LSTMBaseline, TransformerBaseline, create_model, get_model_for_train_mode,
+    create_baseline_model, BASELINE_MODELS, list_available_models,
+    LSTMModel, GRUModel, BiLSTMModel, TCNModel, TransformerModel, InformerModel
 )
 from trainer import train_kfold, get_average_history, get_best_fold
-from evaluator import Evaluator, evaluate_model, compare_models
+from evaluator import Evaluator
 from utils import (
-    set_seed, Logger,
-    load_ppg_data, load_prv_data,
+    set_seed, Logger, EMOTION_NAMES, EMOTION_LABEL_MAP,
+    load_emotion_data_from_folder, load_all_emotion_data,
+    prepare_data_for_training, split_data_by_emotion,
     plot_training_process, plot_predictions, plot_fold_comparison,
     count_parameters, save_model, load_model
 )
@@ -39,17 +92,45 @@ def parse_args():
     parser = argparse.ArgumentParser(description='PPG-Former-DualStream 训练与评估')
     
     parser.add_argument('--config', type=str, default='default',
-                        choices=['default', 'ppg_only', 'ablation_no_pe',
-                                'ablation_no_freq', 'ablation_no_cross_attn',
-                                'ablation_no_uncertainty'],
+                        choices=list_available_configs(),
                         help='配置名称')
     
     parser.add_argument('--mode', type=str, default='train',
                         choices=['train', 'eval', 'ablation'],
                         help='运行模式: train/eval/ablation')
     
+    parser.add_argument('--train_mode', type=str, default=None,
+                        choices=['ppg_only', 'prv_only', 'dual_stream',
+                                'ppg_regression', 'prv_regression',
+                                'ppg_classification', 'prv_classification',
+                                'multi_task',
+                                'baseline_ppg_regression', 'baseline_prv_regression',
+                                'baseline_ppg_classification', 'baseline_prv_classification'],
+                        help='训练模式')
+    
+    parser.add_argument('--baseline_model', type=str, default='lstm',
+                        choices=['lstm', 'gru', 'bilstm', 'tcn', 'transformer_baseline', 'informer'],
+                        help='基准模型名称')
+    
+    parser.add_argument('--task_type', type=str, default=None,
+                        choices=['regression', 'classification', 'multi_task'],
+                        help='任务类型')
+    
     parser.add_argument('--model_path', type=str, default=None,
                         help='模型路径（评估模式使用）')
+    
+    parser.add_argument('--ppg_dir', type=str, default=None,
+                        help='PPG数据目录')
+    
+    parser.add_argument('--prv_dir', type=str, default=None,
+                        help='PRV数据目录')
+    
+    parser.add_argument('--emotions', type=str, default=None,
+                        help='选择的情绪类别，逗号分隔 (如: Stress,Anxiety)')
+    
+    parser.add_argument('--target_emotion', type=str, default=None,
+                        choices=['Anxiety', 'Happy', 'Peace', 'Sad', 'Stress'],
+                        help='压力回归单任务的目标情绪类别（仅用于回归任务）')
     
     parser.add_argument('--epochs', type=int, default=None,
                         help='训练轮数（覆盖配置）')
@@ -66,76 +147,191 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42,
                         help='随机种子')
     
-    parser.add_argument('--use_emotion', action='store_true',
-                        help='是否使用情绪分类任务')
+    # 消融实验参数
+    parser.add_argument('--no_physiological_pe', action='store_true',
+                        help='禁用生理周期位置编码')
+    parser.add_argument('--no_multi_scale_conv', action='store_true',
+                        help='禁用多尺度卷积')
+    parser.add_argument('--no_freq_attention', action='store_true',
+                        help='禁用频域注意力')
+    parser.add_argument('--no_stress_gating', action='store_true',
+                        help='禁用压力感知门控')
+    parser.add_argument('--no_cross_modal', action='store_true',
+                        help='禁用跨模态注意力')
+    parser.add_argument('--no_uncertainty', action='store_true',
+                        help='禁用不确定性加权')
     
     return parser.parse_args()
 
 
-def load_data(config: ExperimentConfig):
-    """加载数据"""
+def load_data_new(config: ExperimentConfig, selected_emotions: List[str] = None):
+    """
+    加载新的数据结构
+    
+    根据任务类型自动选择情绪数据:
+    - 压力回归单任务: 可以根据 target_emotion_for_regression 选择特定情绪类别的数据
+    - 情绪分类单任务: 强制使用全部5种情绪类别的数据
+    - 多任务: 强制使用全部5种情绪类别的数据
+    """
     print("\n===== 加载数据 =====")
     
-    ppg_file = config.data.ppg_file_path
-    prv_file = config.data.prv_file_path
+    ppg_dir = config.data.ppg_data_path
+    prv_dir = config.data.prv_data_path
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
     
-    # 检查数据文件
-    ppg_exists = os.path.exists(ppg_file)
-    prv_exists = os.path.exists(prv_file)
+    # 检查数据目录
+    ppg_exists = os.path.exists(ppg_dir)
+    prv_exists = os.path.exists(prv_dir)
     
     if not ppg_exists and not prv_exists:
-        print(f"错误: 数据文件不存在")
-        print(f"  PPG: {ppg_file}")
-        print(f"  PRV: {prv_file}")
-        return None, None, None, None, None, None
+        print(f"错误: 数据目录不存在")
+        print(f"  PPG: {ppg_dir}")
+        print(f"  PRV: {prv_dir}")
+        return None
     
-    # 加载PPG数据
-    if ppg_exists:
-        (X_ppg_train, y_ppg_train, X_ppg_val, y_ppg_val,
-         X_ppg_test, y_ppg_test, ppg_scaler) = load_ppg_data(
-            ppg_file, config.data.test_size, config.data.val_size
-        )
-        X_ppg_combined = np.concatenate([X_ppg_train, X_ppg_val], axis=0)
-        y_combined = np.concatenate([y_ppg_train, y_ppg_val], axis=0)
+    # 根据任务类型确定使用的情绪类别
+    # 优先级: 函数参数 > 配置方法 > 默认值
+    if selected_emotions is not None:
+        # 如果显式传入了selected_emotions，但是分类任务必须使用全部情绪
+        if task_type in ['classification', 'multi_task']:
+            print(f"警告: 情绪分类/多任务必须使用全部情绪类别，忽略指定的情绪选择")
+            emotions_to_use = config.data.get_emotions_for_task(task_type)
+        else:
+            # 压力回归任务可以使用指定的情绪
+            emotions_to_use = selected_emotions
     else:
-        X_ppg_combined = None
-        X_ppg_test = None
-        y_ppg_test = None
+        # 使用配置方法自动获取情绪类别
+        emotions_to_use = config.data.get_emotions_for_task(task_type)
     
-    # 加载PRV数据
-    if prv_exists:
-        (X_prv_train, y_prv_train, X_prv_val, y_prv_val,
-         X_prv_test, y_prv_test, prv_scaler) = load_prv_data(
-            prv_file, config.data.test_size, config.data.val_size
-        )
-        X_prv_combined = np.concatenate([X_prv_train, X_prv_val], axis=0)
+    print(f"任务类型: {task_type}")
+    print(f"使用情绪类别: {emotions_to_use}")
+    
+    # 对于分类任务，验证情绪数量
+    if task_type in ['classification', 'multi_task'] and len(emotions_to_use) < 5:
+        print(f"错误: 情绪分类/多任务必须使用全部5种情绪类别")
+        return None
+    
+    # 替换原来的 selected_emotions 变量为 emotions_to_use
+    selected_emotions = emotions_to_use
+    
+    # 根据训练模式决定加载哪些数据
+    result = {}
+    
+    if train_mode in ['ppg_only', 'ppg_regression', 'ppg_classification',
+                       'baseline_ppg_regression', 'baseline_ppg_classification']:
+        # 仅加载PPG数据
+        if not ppg_exists:
+            print(f"错误: PPG数据目录不存在: {ppg_dir}")
+            return None
         
-        if X_ppg_combined is None:
-            X_ppg_combined = X_prv_combined
-            X_ppg_test = X_prv_test
-            y_combined = np.concatenate([y_prv_train, y_prv_val], axis=0)
-            y_ppg_test = y_prv_test
+        ppg_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
+            ppg_dir, "PPG", selected_emotions
+        )
+        
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        ppg_features = scaler.fit_transform(ppg_features)
+        
+        result['X_data'] = ppg_features
+        result['y_stress'] = stress_labels
+        result['y_emotion'] = emotion_labels
+        result['X_prv'] = None
+        result['scaler'] = scaler
+        
+    elif train_mode in ['prv_only', 'prv_regression', 'prv_classification',
+                         'baseline_prv_regression', 'baseline_prv_classification']:
+        # 仅加载PRV数据
+        if not prv_exists:
+            print(f"错误: PRV数据目录不存在: {prv_dir}")
+            return None
+        
+        prv_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
+            prv_dir, "PRV", selected_emotions
+        )
+        
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        prv_features = scaler.fit_transform(prv_features)
+        
+        result['X_data'] = prv_features
+        result['y_stress'] = stress_labels
+        result['y_emotion'] = emotion_labels
+        result['X_prv'] = None
+        result['scaler'] = scaler
+        
     else:
-        X_prv_combined = None
-        X_prv_test = None
+        # 加载双流数据 (dual_stream / multi_task)
+        data = load_all_emotion_data(ppg_dir, prv_dir, selected_emotions, normalize=True)
+        
+        result['X_data'] = data['ppg_features']
+        result['X_prv'] = data.get('prv_features', None)
+        result['y_stress'] = data['stress_labels']
+        result['y_emotion'] = data['emotion_labels']
+        result['scaler'] = data.get('ppg_scaler', None)
+    
+    # 验证分类任务必须使用全部5种情绪
+    if task_type in ['classification', 'multi_task']:
+        unique_emotions = len(np.unique(result['y_emotion']))
+        if unique_emotions < 5:
+            print(f"警告: 分类任务建议使用全部5种情绪数据，当前只有 {unique_emotions} 种")
     
     print(f"\n数据加载完成:")
-    if X_ppg_combined is not None:
-        print(f"  PPG数据形状: {X_ppg_combined.shape}")
-    if X_prv_combined is not None:
-        print(f"  PRV数据形状: {X_prv_combined.shape}")
-    print(f"  训练+验证集大小: {len(y_combined)}")
-    print(f"  测试集大小: {len(y_ppg_test)}")
+    print(f"  主数据形状: {result['X_data'].shape}")
+    if result['X_prv'] is not None:
+        print(f"  PRV数据形状: {result['X_prv'].shape}")
+    print(f"  压力标签形状: {result['y_stress'].shape}")
+    print(f"  情绪标签分布: {dict(zip(*np.unique(result['y_emotion'], return_counts=True)))}")
     
-    return (X_ppg_combined, X_prv_combined, y_combined,
-            X_ppg_test, X_prv_test, y_ppg_test)
+    return result
 
 
-def get_model_class_and_params(config: ExperimentConfig, X_prv=None):
+def get_model_and_params(config: ExperimentConfig, has_prv: bool = False):
     """根据配置获取模型类和参数"""
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
     
-    if config.ablation.use_dual_stream and X_prv is not None:
-        # 使用双流模型
+    # 检查是否是基准模型训练模式
+    if train_mode.startswith('baseline_'):
+        return get_baseline_model_and_params(config)
+    
+    if train_mode in ['ppg_only', 'ppg_regression', 'ppg_classification']:
+        model_class = PPGFormer
+        model_params = {
+            'input_dim': config.model.ppg_input_dim,
+            'd_model': config.model.d_model,
+            'n_heads': config.model.n_heads,
+            'd_ff': config.model.d_ff,
+            'num_layers': config.model.ppg_layers,
+            'num_classes': config.model.num_emotions,
+            'scales': config.model.scales,
+            'dropout': config.model.dropout,
+            'task_type': task_type,
+            'use_physiological_pe': config.ablation.use_physiological_pe,
+            'use_multi_scale_conv': config.ablation.use_multi_scale_conv,
+            'use_time_freq_attention': config.ablation.use_time_freq_attention,
+            'use_freq_attention': config.ablation.use_freq_attention,
+            'use_stress_gating': config.ablation.use_stress_gating,
+            'use_uncertainty_weighting': config.ablation.use_uncertainty_weighting
+        }
+        model_name = "PPGFormer"
+        
+    elif train_mode in ['prv_only', 'prv_regression', 'prv_classification']:
+        model_class = PRVModel
+        model_params = {
+            'input_dim': config.model.prv_input_dim,
+            'd_model': config.model.d_model,
+            'n_heads': config.model.n_heads,
+            'num_layers': config.model.prv_layers,
+            'num_classes': config.model.num_emotions,
+            'dropout': config.model.dropout,
+            'task_type': task_type,
+            'use_uncertainty_weighting': config.ablation.use_uncertainty_weighting
+        }
+        model_name = "PRVModel"
+        
+    else:
+        # dual_stream / multi_task
         model_class = PPGFormerDualStream
         model_params = {
             'ppg_input_dim': config.model.ppg_input_dim,
@@ -158,51 +354,98 @@ def get_model_class_and_params(config: ExperimentConfig, X_prv=None):
             'use_uncertainty_weighting': config.ablation.use_uncertainty_weighting
         }
         model_name = "PPGFormerDualStream"
-    else:
-        # 使用单流PPG-Former模型
-        model_class = PPGFormer
-        model_params = {
-            'input_dim': config.model.ppg_input_dim,
-            'output_dim': 1,
-            'd_model': config.model.d_model,
-            'n_heads': config.model.n_heads,
-            'd_ff': config.model.d_ff,
-            'num_layers': config.model.ppg_layers,
-            'scales': config.model.scales,
-            'dropout': config.model.dropout,
-            'use_physiological_pe': config.ablation.use_physiological_pe,
-            'use_multi_scale_conv': config.ablation.use_multi_scale_conv,
-            'use_time_freq_attention': config.ablation.use_time_freq_attention,
-            'use_freq_attention': config.ablation.use_freq_attention,
-            'use_stress_gating': config.ablation.use_stress_gating
-        }
-        model_name = "PPGFormer"
     
     return model_class, model_params, model_name
 
 
-def train_mode(args, config: ExperimentConfig):
+def get_baseline_model_and_params(config: ExperimentConfig):
+    """获取基准模型类和参数"""
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
+    baseline_config = config.baseline_model
+    
+    # 确定输入维度
+    if 'ppg' in train_mode:
+        input_dim = config.model.ppg_input_dim
+    else:
+        input_dim = config.model.prv_input_dim
+    
+    # 模型映射
+    model_name_map = {
+        'lstm': LSTMModel,
+        'gru': GRUModel,
+        'bilstm': BiLSTMModel,
+        'tcn': TCNModel,
+        'transformer_baseline': TransformerModel,
+        'informer': InformerModel,
+    }
+    
+    model_name = baseline_config.model_name.lower()
+    if model_name not in model_name_map:
+        raise ValueError(f"未知基准模型: {model_name}")
+    
+    model_class = model_name_map[model_name]
+    
+    # 构建模型参数
+    model_params = {
+        'input_dim': input_dim,
+        'hidden_dim': baseline_config.hidden_dim,
+        'num_layers': baseline_config.num_layers,
+        'num_classes': baseline_config.num_classes,
+        'dropout': baseline_config.dropout,
+        'task_type': task_type,
+    }
+    
+    # 为TCN添加kernel_size参数
+    if model_name == 'tcn':
+        model_params['kernel_size'] = baseline_config.kernel_size
+    
+    # 为Transformer/Informer添加n_heads参数
+    if model_name in ['transformer_baseline', 'informer']:
+        model_params['n_heads'] = baseline_config.n_heads
+    
+    # 模型显示名称
+    display_name = f"Baseline_{model_name.upper()}"
+    
+    return model_class, model_params, display_name
+
+
+def train_mode_func(args, config: ExperimentConfig):
     """训练模式"""
+    # 解析选择的情绪
+    selected_emotions = None
+    if args.emotions:
+        selected_emotions = [e.strip() for e in args.emotions.split(',')]
+    
     # 加载数据
-    data = load_data(config)
-    if data[0] is None:
+    data = load_data_new(config, selected_emotions)
+    if data is None:
         return
     
-    X_ppg, X_prv, y_stress, X_ppg_test, X_prv_test, y_test = data
+    X_data = data['X_data']
+    X_prv = data['X_prv']
+    y_stress = data['y_stress']
+    y_emotion = data['y_emotion']
     
     # 获取模型配置
-    model_class, model_params, model_name = get_model_class_and_params(config, X_prv)
+    model_class, model_params, model_name = get_model_and_params(config, X_prv is not None)
     
-    print(f"\n===== 模型配置 =====")
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
+    
+    print(f"\n===== 训练配置 =====")
+    print(f"训练模式: {train_mode}")
+    print(f"任务类型: {task_type}")
     print(f"模型类型: {model_name}")
     print(f"模型参数:")
     for key, value in model_params.items():
-        print(f"  {key}: {value}")
+        if not key.startswith('use_'):
+            print(f"  {key}: {value}")
     
     # 创建日志器
     logger = Logger(
         log_dir=config.log.log_dir,
-        experiment_name=config.experiment_name,
+        experiment_name=f"{config.experiment_name}_{train_mode}",
         log_level=config.log.log_level
     )
     logger.log_config(config)
@@ -222,26 +465,30 @@ def train_mode(args, config: ExperimentConfig):
     print(f"可训练参数量: {trainable_params:,}")
     del temp_model
     
+    # 确定是否使用情绪任务
+    use_emotion = task_type in ['classification', 'multi_task']
+    
     # 开始训练
     print(f"\n===== 开始 {config.training.k_folds} 折交叉验证训练 =====")
     
     all_histories, best_model_states, fold_results = train_kfold(
         model_class=model_class,
         model_params=model_params,
-        X_ppg=X_ppg,
+        X_data=X_data,
         X_prv=X_prv,
         y_stress=y_stress,
-        y_emotion=None,
+        y_emotion=y_emotion,
         config=config,
         logger=logger,
-        use_emotion=args.use_emotion
+        use_emotion=use_emotion,
+        stratify_by_emotion=(task_type == 'classification')
     )
     
     # 计算平均历史
     avg_history = get_average_history(all_histories)
     
     # 绘制训练过程
-    if config.log.save_plots:
+    if config.log.save_plots and task_type != 'classification':
         plot_training_process(
             avg_history['train_losses'], avg_history['val_losses'],
             avg_history['train_maes'], avg_history['val_maes'],
@@ -259,39 +506,10 @@ def train_mode(args, config: ExperimentConfig):
     best_model.load_state_dict(best_model_states[best_fold_idx])
     best_model.to(device)
     
-    # 创建测试数据加载器
-    if X_prv_test is not None:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(X_prv_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
-    else:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
-    test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size)
-    
-    # 评估
-    print("\n===== 在测试集上评估 =====")
-    evaluator = Evaluator(best_model, device, logger)
-    test_metrics = evaluator.evaluate_regression(test_loader)
-    
-    # 绘制预测结果
-    if config.log.save_plots:
-        plot_predictions(
-            test_metrics['predictions'], test_metrics['targets'],
-            model_name, config.log.result_dir, show=False
-        )
-    
-    # 记录测试结果
-    logger.log_test_result(test_metrics['loss'], test_metrics['mae'], test_metrics['rmse'])
-    
     # 保存模型
     model_save_path = os.path.join(
         config.log.model_save_dir,
-        f"{model_name}_{logger.timestamp}.pth"
+        f"{model_name}_{train_mode}_{logger.timestamp}.pth"
     )
     save_model(best_model, model_save_path, config)
     
@@ -299,16 +517,15 @@ def train_mode(args, config: ExperimentConfig):
     logger.save_history()
     
     print("\n===== 训练完成 =====")
-    print(f"最终测试结果:")
-    print(f"  Loss: {test_metrics['loss']:.4f}")
-    print(f"  MAE: {test_metrics['mae']:.4f}")
-    print(f"  RMSE: {test_metrics['rmse']:.4f}")
-    print(f"  R²: {test_metrics['r2']:.4f}")
+    print(f"最佳折结果:")
+    for key, value in fold_results[best_fold_idx].items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.4f}")
     print(f"\n模型已保存到: {model_save_path}")
     print(f"日志已保存到: {logger.log_file}")
 
 
-def eval_mode(args, config: ExperimentConfig):
+def eval_mode_func(args, config: ExperimentConfig):
     """评估模式"""
     if args.model_path is None:
         print("错误: 评估模式需要指定模型路径 (--model_path)")
@@ -318,15 +535,26 @@ def eval_mode(args, config: ExperimentConfig):
         print(f"错误: 模型文件不存在: {args.model_path}")
         return
     
+    # 解析选择的情绪
+    selected_emotions = None
+    if args.emotions:
+        selected_emotions = [e.strip() for e in args.emotions.split(',')]
+    
     # 加载数据
-    data = load_data(config)
-    if data[0] is None:
+    data = load_data_new(config, selected_emotions)
+    if data is None:
         return
     
-    X_ppg, X_prv, y_stress, X_ppg_test, X_prv_test, y_test = data
+    X_data = data['X_data']
+    X_prv = data['X_prv']
+    y_stress = data['y_stress']
+    y_emotion = data['y_emotion']
     
     # 获取模型配置
-    model_class, model_params, model_name = get_model_class_and_params(config, X_prv)
+    model_class, model_params, model_name = get_model_and_params(config, X_prv is not None)
+    
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
     
     # 设置设备
     device = args.device if args.device else config.device
@@ -339,162 +567,172 @@ def eval_mode(args, config: ExperimentConfig):
     model = load_model(model, args.model_path, device)
     model.to(device)
     
+    # 划分测试集
+    split_result = split_data_by_emotion(
+        X_data, y_stress, y_emotion,
+        test_size=config.data.test_size, val_size=0
+    )
+    
+    X_test = split_result['X_test']
+    y_stress_test = split_result['y_stress_test']
+    y_emotion_test = split_result['y_emotion_test']
+    
     # 创建测试数据加载器
-    if X_prv_test is not None:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(X_prv_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
+    if task_type == 'classification':
+        test_tensors = [
+            torch.tensor(X_test, dtype=torch.float32),
+            torch.tensor(y_emotion_test, dtype=torch.long)
+        ]
+    elif task_type == 'multi_task':
+        if X_prv is not None:
+            X_prv_test = split_result['X_test']  # 需要对应的PRV测试数据
+            test_tensors = [
+                torch.tensor(X_test, dtype=torch.float32),
+                torch.tensor(X_prv_test, dtype=torch.float32),
+                torch.tensor(y_stress_test, dtype=torch.float32).reshape(-1, 1),
+                torch.tensor(y_emotion_test, dtype=torch.long)
+            ]
+        else:
+            test_tensors = [
+                torch.tensor(X_test, dtype=torch.float32),
+                torch.tensor(y_stress_test, dtype=torch.float32).reshape(-1, 1),
+                torch.tensor(y_emotion_test, dtype=torch.long)
+            ]
     else:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
+        test_tensors = [
+            torch.tensor(X_test, dtype=torch.float32),
+            torch.tensor(y_stress_test, dtype=torch.float32).reshape(-1, 1)
+        ]
+    
+    test_dataset = TensorDataset(*test_tensors)
     test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size)
     
     # 评估
     print("\n===== 模型评估 =====")
-    evaluator = Evaluator(model, device)
-    test_metrics = evaluator.evaluate_regression(test_loader)
+    evaluator = Evaluator(model, device, task_type=task_type, train_mode=train_mode)
+    
+    if task_type == 'classification':
+        test_metrics = evaluator.evaluate_classification(test_loader)
+    elif task_type == 'multi_task':
+        test_metrics = evaluator.evaluate_multi_task(test_loader)
+    else:
+        test_metrics = evaluator.evaluate_regression(test_loader)
     
     # 绘制结果
-    if config.log.save_plots:
+    if config.log.save_plots and 'predictions' in test_metrics:
         plot_predictions(
             test_metrics['predictions'], test_metrics['targets'],
             model_name + "_eval", config.log.result_dir, show=True
         )
 
 
-def ablation_mode(args, config: ExperimentConfig):
+def ablation_mode_func(args, config: ExperimentConfig):
     """消融实验模式"""
     print("\n===== 消融实验 =====")
     
     # 加载数据
-    data = load_data(config)
-    if data[0] is None:
+    data = load_data_new(config)
+    if data is None:
         return
     
-    X_ppg, X_prv, y_stress, X_ppg_test, X_prv_test, y_test = data
+    X_data = data['X_data']
+    X_prv = data['X_prv']
+    y_stress = data['y_stress']
+    y_emotion = data['y_emotion']
     
     # 设置设备
     device = args.device if args.device else config.device
     if device == 'cuda' and not torch.cuda.is_available():
         device = 'cpu'
     
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
+    
+    # 获取基础模型配置
+    model_class, base_params, model_name = get_model_and_params(config, X_prv is not None)
+    
     # 定义消融配置
     ablation_configs = {
-        'w/o Physiological PE': {
-            'use_physiological_pe': False
-        },
-        'w/o Multi-Scale Conv': {
-            'use_multi_scale_conv': False
-        },
-        'w/o Freq Attention': {
-            'use_freq_attention': False
-        },
-        'w/o Stress Gating': {
-            'use_stress_gating': False
-        },
-        'w/o Cross-Modal Attn': {
-            'use_cross_modal_attention': False
-        },
-        'w/o Uncertainty Weighting': {
-            'use_uncertainty_weighting': False
-        }
+        'Full Model (Baseline)': {},
+        'w/o Physiological PE': {'use_physiological_pe': False},
+        'w/o Multi-Scale Conv': {'use_multi_scale_conv': False},
+        'w/o Freq Attention': {'use_freq_attention': False},
+        'w/o Stress Gating': {'use_stress_gating': False},
     }
     
-    # 基础模型参数
-    if X_prv is not None:
-        base_params = {
-            'ppg_input_dim': config.model.ppg_input_dim,
-            'prv_input_dim': config.model.prv_input_dim,
-            'd_model': config.model.d_model,
-            'n_heads': config.model.n_heads,
-            'd_ff': config.model.d_ff,
-            'ppg_layers': config.model.ppg_layers,
-            'prv_layers': config.model.prv_layers,
-            'fusion_layers': config.model.fusion_layers,
-            'num_emotions': config.model.num_emotions,
-            'scales': config.model.scales,
-            'dropout': config.model.dropout,
-            'use_physiological_pe': True,
-            'use_multi_scale_conv': True,
-            'use_time_freq_attention': True,
-            'use_freq_attention': True,
-            'use_stress_gating': True,
-            'use_cross_modal_attention': True,
-            'use_uncertainty_weighting': True
-        }
-        model_class = PPGFormerDualStream
-    else:
-        base_params = {
-            'input_dim': config.model.ppg_input_dim,
-            'output_dim': 1,
-            'd_model': config.model.d_model,
-            'n_heads': config.model.n_heads,
-            'd_ff': config.model.d_ff,
-            'num_layers': config.model.ppg_layers,
-            'scales': config.model.scales,
-            'dropout': config.model.dropout,
-            'use_physiological_pe': True,
-            'use_multi_scale_conv': True,
-            'use_time_freq_attention': True,
-            'use_freq_attention': True,
-            'use_stress_gating': True
-        }
-        model_class = PPGFormer
-        # 移除双流相关的消融配置
-        del ablation_configs['w/o Cross-Modal Attn']
-        del ablation_configs['w/o Uncertainty Weighting']
+    # 如果是双流模型，添加更多消融配置
+    if train_mode in ['dual_stream', 'multi_task']:
+        ablation_configs['w/o Cross-Modal Attn'] = {'use_cross_modal_attention': False}
+        ablation_configs['w/o Uncertainty Weighting'] = {'use_uncertainty_weighting': False}
     
-    # 创建测试数据加载器
-    if X_prv_test is not None:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(X_prv_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
-    else:
-        test_dataset = TensorDataset(
-            torch.tensor(X_ppg_test, dtype=torch.float32),
-            torch.tensor(y_test, dtype=torch.float32).reshape(-1, 1)
-        )
-    test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size)
+    # 创建日志器
+    logger = Logger(
+        log_dir=config.log.log_dir,
+        experiment_name=f"Ablation_{train_mode}",
+        log_level=config.log.log_level
+    )
     
-    print("\n注意: 消融实验需要先训练每个配置的模型")
-    print("这里仅展示未训练模型的初始评估结果（用于验证代码正确性）")
-    print("实际消融实验需要对每个配置进行完整训练\n")
+    print(f"训练模式: {train_mode}")
+    print(f"任务类型: {task_type}")
+    print(f"消融配置数量: {len(ablation_configs)}")
+    print()
     
-    # 评估各配置
     results = {}
     
-    # 基线模型
-    print("评估: Baseline (Full Model)")
-    baseline_model = model_class(**base_params)
-    evaluator = Evaluator(baseline_model, device)
-    baseline_metrics = evaluator.evaluate_regression(test_loader, return_predictions=False)
-    results['Baseline'] = baseline_metrics
-    
-    # 消融配置
     for config_name, changes in ablation_configs.items():
-        print(f"\n评估: {config_name}")
+        print(f"\n{'='*50}")
+        print(f"消融实验: {config_name}")
+        print(f"{'='*50}")
         
+        # 更新参数
         ablation_params = base_params.copy()
         ablation_params.update(changes)
         
-        ablation_model = model_class(**ablation_params)
-        evaluator = Evaluator(ablation_model, device)
-        metrics = evaluator.evaluate_regression(test_loader, return_predictions=False)
-        results[config_name] = metrics
+        # 训练K折
+        all_histories, best_model_states, fold_results = train_kfold(
+            model_class=model_class,
+            model_params=ablation_params,
+            X_data=X_data,
+            X_prv=X_prv,
+            y_stress=y_stress,
+            y_emotion=y_emotion,
+            config=config,
+            logger=None,  # 不记录到文件
+            use_emotion=(task_type in ['classification', 'multi_task']),
+            stratify_by_emotion=(task_type == 'classification')
+        )
+        
+        # 计算平均结果
+        avg_result = {
+            'val_loss': np.mean([r['val_loss'] for r in fold_results]),
+            'val_mae': np.mean([r['val_mae'] for r in fold_results]),
+            'val_rmse': np.mean([r['val_rmse'] for r in fold_results]),
+            'val_accuracy': np.mean([r.get('val_accuracy', 0) for r in fold_results]),
+            'val_f1': np.mean([r.get('val_f1', 0) for r in fold_results]),
+        }
+        
+        results[config_name] = avg_result
     
     # 打印结果表格
-    print("\n===== 消融实验结果汇总 =====")
-    print(f"{'配置':<30} {'RMSE':>10} {'MAE':>10} {'R²':>10}")
-    print("-" * 60)
+    print("\n" + "="*80)
+    print("消融实验结果汇总")
+    print("="*80)
     
-    for name, metrics in results.items():
-        print(f"{name:<30} {metrics['rmse']:>10.4f} {metrics['mae']:>10.4f} {metrics['r2']:>10.4f}")
+    if task_type == 'classification':
+        print(f"{'配置':<35} {'Accuracy':>12} {'F1':>12}")
+        print("-" * 60)
+        for name, metrics in results.items():
+            print(f"{name:<35} {metrics['val_accuracy']:>12.4f} {metrics['val_f1']:>12.4f}")
+    else:
+        print(f"{'配置':<35} {'MAE':>12} {'RMSE':>12}")
+        print("-" * 60)
+        for name, metrics in results.items():
+            print(f"{name:<35} {metrics['val_mae']:>12.4f} {metrics['val_rmse']:>12.4f}")
+    
+    # 保存结果
+    logger.history['ablation_results'] = results
+    logger.save_history()
+    print(f"\n结果已保存到: {logger.log_file}")
 
 
 def main():
@@ -506,9 +744,33 @@ def main():
     set_seed(args.seed)
     
     # 获取配置
-    config = get_config(args.config)
+    # 检查是否是基准模型训练模式
+    if args.train_mode and args.train_mode.startswith('baseline_'):
+        config = get_config(args.train_mode, args.baseline_model)
+    else:
+        config = get_config(args.config)
     
     # 覆盖配置
+    if args.train_mode:
+        config.training.train_mode = args.train_mode
+        # 根据训练模式自动设置任务类型
+        if args.train_mode in ['ppg_regression', 'prv_regression',
+                                'baseline_ppg_regression', 'baseline_prv_regression']:
+            config.training.task_type = 'regression'
+        elif args.train_mode in ['ppg_classification', 'prv_classification',
+                                   'baseline_ppg_classification', 'baseline_prv_classification']:
+            config.training.task_type = 'classification'
+        elif args.train_mode == 'multi_task':
+            config.training.task_type = 'multi_task'
+        
+        # 如果是基准模型模式，设置基准模型名称
+        if args.train_mode.startswith('baseline_'):
+            config.use_baseline_model = True
+            config.baseline_model.model_name = args.baseline_model
+    
+    if args.task_type:
+        config.training.task_type = args.task_type
+    
     if args.epochs:
         config.training.num_epochs = args.epochs
     if args.batch_size:
@@ -517,21 +779,52 @@ def main():
         config.training.learning_rate = args.lr
     if args.device:
         config.device = args.device
+    if args.ppg_dir:
+        config.data.data_root = os.path.dirname(args.ppg_dir)
+        config.data.ppg_dir = os.path.basename(args.ppg_dir)
+    if args.prv_dir:
+        config.data.prv_dir = os.path.basename(args.prv_dir)
+    
+    # 处理目标情绪参数（仅用于压力回归任务）
+    if args.target_emotion:
+        if config.training.task_type == 'regression':
+            config.data.target_emotion_for_regression = args.target_emotion
+            print(f"压力回归任务目标情绪: {args.target_emotion}")
+        else:
+            print(f"警告: --target_emotion 参数仅对压力回归任务有效，当前任务类型为 {config.training.task_type}")
+    
+    # 应用消融实验参数
+    if args.no_physiological_pe:
+        config.ablation.use_physiological_pe = False
+    if args.no_multi_scale_conv:
+        config.ablation.use_multi_scale_conv = False
+    if args.no_freq_attention:
+        config.ablation.use_freq_attention = False
+    if args.no_stress_gating:
+        config.ablation.use_stress_gating = False
+    if args.no_cross_modal:
+        config.ablation.use_cross_modal_attention = False
+    if args.no_uncertainty:
+        config.ablation.use_uncertainty_weighting = False
     
     print("=" * 60)
     print("PPG-Former-DualStream 多任务压力预测模型")
     print("=" * 60)
     print(f"配置: {args.config}")
     print(f"模式: {args.mode}")
+    print(f"训练模式: {config.training.train_mode}")
+    print(f"任务类型: {config.training.task_type}")
+    if config.use_baseline_model:
+        print(f"基准模型: {config.baseline_model.model_name}")
     print(f"实验名称: {config.experiment_name}")
     
     # 执行对应模式
     if args.mode == 'train':
-        train_mode(args, config)
+        train_mode_func(args, config)
     elif args.mode == 'eval':
-        eval_mode(args, config)
+        eval_mode_func(args, config)
     elif args.mode == 'ablation':
-        ablation_mode(args, config)
+        ablation_mode_func(args, config)
     else:
         print(f"未知模式: {args.mode}")
 

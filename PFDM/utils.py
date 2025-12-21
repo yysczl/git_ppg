@@ -203,10 +203,289 @@ class MultiModalDataset(Dataset):
 
 
 # ============ 数据加载函数 ============
+# 情绪标签映射
+EMOTION_LABEL_MAP = {
+    "Anxiety": 0,
+    "Happy": 1,
+    "Peace": 2,
+    "Sad": 3,
+    "Stress": 4
+}
+
+EMOTION_NAMES = ["Anxiety", "Happy", "Peace", "Sad", "Stress"]
+
+
+def load_emotion_data_from_folder(data_dir: str, signal_type: str = "PPG",
+                                   selected_emotions: List[str] = None,
+                                   emotion_label_map: Dict[str, int] = None
+                                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    从文件夹加载情绪数据
+    
+    数据结构说明:
+    - 每个文件名表示情绪类别 (Anxiety.csv, Happy.csv, etc.)
+    - 每个文件包含90个样本
+    - 最后一列为压力标签值
+    
+    Args:
+        data_dir: 数据目录路径
+        signal_type: 信号类型 ("PPG" 或 "PRV")
+        selected_emotions: 选择的情绪类别列表，None表示全部
+        emotion_label_map: 情绪标签映射字典
+    
+    Returns:
+        features: 特征数据 [n_samples, seq_len]
+        stress_labels: 压力标签 [n_samples]
+        emotion_labels: 情绪标签 [n_samples]
+    """
+    if emotion_label_map is None:
+        emotion_label_map = EMOTION_LABEL_MAP
+    
+    if selected_emotions is None:
+        selected_emotions = EMOTION_NAMES
+    
+    all_features = []
+    all_stress_labels = []
+    all_emotion_labels = []
+    
+    for emotion in selected_emotions:
+        file_path = os.path.join(data_dir, f"{emotion}.csv")
+        
+        if not os.path.exists(file_path):
+            print(f"警告: 文件不存在 - {file_path}")
+            continue
+        
+        try:
+            # 读取数据
+            data = pd.read_csv(file_path, header=None, skiprows=1)
+            print(f"加载 {emotion} {signal_type} 数据: {data.shape}")
+            
+            # 根据信号类型确定特征列数
+            if signal_type == "PPG":
+                seq_len = 1800
+            else:  # PRV
+                seq_len = 80
+            
+            # 提取特征和压力标签
+            features = data.iloc[:, :seq_len].values
+            stress_labels = data.iloc[:, -1].values
+            
+            # 生成情绪标签
+            emotion_label = emotion_label_map[emotion]
+            emotion_labels = np.full(len(features), emotion_label)
+            
+            all_features.append(features)
+            all_stress_labels.append(stress_labels)
+            all_emotion_labels.append(emotion_labels)
+            
+        except Exception as e:
+            print(f"读取文件出错 {file_path}: {e}")
+            continue
+    
+    if len(all_features) == 0:
+        raise ValueError(f"没有成功加载任何数据，请检查目录: {data_dir}")
+    
+    # 合并所有数据
+    features = np.concatenate(all_features, axis=0)
+    stress_labels = np.concatenate(all_stress_labels, axis=0)
+    emotion_labels = np.concatenate(all_emotion_labels, axis=0)
+    
+    print(f"\n{signal_type}数据加载完成:")
+    print(f"  特征形状: {features.shape}")
+    print(f"  压力标签形状: {stress_labels.shape}")
+    print(f"  情绪标签形状: {emotion_labels.shape}")
+    print(f"  情绪类别分布: {dict(zip(*np.unique(emotion_labels, return_counts=True)))}")
+    
+    return features, stress_labels, emotion_labels
+
+
+def load_all_emotion_data(ppg_dir: str, prv_dir: str = None,
+                          selected_emotions: List[str] = None,
+                          normalize: bool = True
+                          ) -> Dict[str, np.ndarray]:
+    """
+    加载所有情绪数据（PPG和PRV）
+    
+    Args:
+        ppg_dir: PPG数据目录
+        prv_dir: PRV数据目录，None表示不加载PRV
+        selected_emotions: 选择的情绪类别
+        normalize: 是否标准化特征
+    
+    Returns:
+        包含数据的字典
+    """
+    result = {}
+    
+    # 加载PPG数据
+    ppg_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
+        ppg_dir, "PPG", selected_emotions
+    )
+    
+    if normalize:
+        ppg_scaler = StandardScaler()
+        ppg_features = ppg_scaler.fit_transform(ppg_features)
+        result['ppg_scaler'] = ppg_scaler
+    
+    result['ppg_features'] = ppg_features
+    result['stress_labels'] = stress_labels
+    result['emotion_labels'] = emotion_labels
+    
+    # 加载PRV数据
+    if prv_dir is not None and os.path.exists(prv_dir):
+        prv_features, _, _ = load_emotion_data_from_folder(
+            prv_dir, "PRV", selected_emotions
+        )
+        
+        if normalize:
+            prv_scaler = StandardScaler()
+            prv_features = prv_scaler.fit_transform(prv_features)
+            result['prv_scaler'] = prv_scaler
+        
+        result['prv_features'] = prv_features
+    
+    return result
+
+
+def split_data_by_emotion(features: np.ndarray, stress_labels: np.ndarray,
+                          emotion_labels: np.ndarray,
+                          test_size: float = 0.1, val_size: float = 0.1,
+                          stratify_by_emotion: bool = True
+                          ) -> Dict[str, np.ndarray]:
+    """
+    划分数据集，保持情绪类别平衡
+    
+    Args:
+        features: 特征数据
+        stress_labels: 压力标签
+        emotion_labels: 情绪标签
+        test_size: 测试集比例
+        val_size: 验证集比例
+        stratify_by_emotion: 是否按情绪分层抽样
+    
+    Returns:
+        包含划分后数据的字典
+    """
+    stratify = emotion_labels if stratify_by_emotion else None
+    
+    # 先划分出测试集
+    X_temp, X_test, y_stress_temp, y_stress_test, y_emotion_temp, y_emotion_test = train_test_split(
+        features, stress_labels, emotion_labels,
+        test_size=test_size, random_state=42, stratify=stratify
+    )
+    
+    # 再从剩余数据中划分验证集
+    val_ratio = val_size / (1 - test_size)
+    stratify_temp = y_emotion_temp if stratify_by_emotion else None
+    
+    X_train, X_val, y_stress_train, y_stress_val, y_emotion_train, y_emotion_val = train_test_split(
+        X_temp, y_stress_temp, y_emotion_temp,
+        test_size=val_ratio, random_state=42, stratify=stratify_temp
+    )
+    
+    print(f"\n数据划分结果:")
+    print(f"  训练集: {X_train.shape}")
+    print(f"  验证集: {X_val.shape}")
+    print(f"  测试集: {X_test.shape}")
+    
+    return {
+        'X_train': X_train, 'X_val': X_val, 'X_test': X_test,
+        'y_stress_train': y_stress_train, 'y_stress_val': y_stress_val, 'y_stress_test': y_stress_test,
+        'y_emotion_train': y_emotion_train, 'y_emotion_val': y_emotion_val, 'y_emotion_test': y_emotion_test
+    }
+
+
+def prepare_data_for_training(ppg_dir: str, prv_dir: str = None,
+                               selected_emotions: List[str] = None,
+                               test_size: float = 0.1, val_size: float = 0.1,
+                               normalize: bool = True
+                               ) -> Dict[str, Any]:
+    """
+    为训练准备数据（包括加载、划分、标准化）
+    
+    Args:
+        ppg_dir: PPG数据目录
+        prv_dir: PRV数据目录
+        selected_emotions: 选择的情绪类别
+        test_size: 测试集比例
+        val_size: 验证集比例
+        normalize: 是否标准化
+    
+    Returns:
+        包含所有训练所需数据的字典
+    """
+    # 加载数据
+    data = load_all_emotion_data(ppg_dir, prv_dir, selected_emotions, normalize)
+    
+    # 划分PPG数据
+    ppg_split = split_data_by_emotion(
+        data['ppg_features'], data['stress_labels'], data['emotion_labels'],
+        test_size, val_size
+    )
+    
+    result = {
+        'X_ppg_train': ppg_split['X_train'],
+        'X_ppg_val': ppg_split['X_val'],
+        'X_ppg_test': ppg_split['X_test'],
+        'y_stress_train': ppg_split['y_stress_train'],
+        'y_stress_val': ppg_split['y_stress_val'],
+        'y_stress_test': ppg_split['y_stress_test'],
+        'y_emotion_train': ppg_split['y_emotion_train'],
+        'y_emotion_val': ppg_split['y_emotion_val'],
+        'y_emotion_test': ppg_split['y_emotion_test'],
+    }
+    
+    # 如果有PRV数据，使用相同的索引划分
+    if 'prv_features' in data:
+        # 为了保持PPG和PRV数据对齐，我们需要重新划分
+        # 使用相同的索引
+        prv_split = split_data_by_emotion(
+            data['prv_features'], data['stress_labels'], data['emotion_labels'],
+            test_size, val_size
+        )
+        
+        result['X_prv_train'] = prv_split['X_train']
+        result['X_prv_val'] = prv_split['X_val']
+        result['X_prv_test'] = prv_split['X_test']
+    
+    if 'ppg_scaler' in data:
+        result['ppg_scaler'] = data['ppg_scaler']
+    if 'prv_scaler' in data:
+        result['prv_scaler'] = data['prv_scaler']
+    
+    return result
+
+
+def load_single_emotion_data(data_dir: str, emotion: str, signal_type: str = "PPG",
+                              normalize: bool = True) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    加载单个情绪类别的数据
+    
+    Args:
+        data_dir: 数据目录
+        emotion: 情绪名称
+        signal_type: 信号类型
+        normalize: 是否标准化
+    
+    Returns:
+        features: 特征数据
+        stress_labels: 压力标签
+        emotion_label: 情绪标签数字
+    """
+    features, stress_labels, emotion_labels = load_emotion_data_from_folder(
+        data_dir, signal_type, [emotion]
+    )
+    
+    if normalize:
+        scaler = StandardScaler()
+        features = scaler.fit_transform(features)
+    
+    return features, stress_labels, EMOTION_LABEL_MAP[emotion]
+
 def load_ppg_data(file_path: str, test_size: float = 0.1, val_size: float = 0.1
                   ) -> Tuple[np.ndarray, ...]:
     """
-    加载PPG数据
+    加载单个PPG数据文件（向后兼容）
     
     Args:
         file_path: 数据文件路径
@@ -216,6 +495,23 @@ def load_ppg_data(file_path: str, test_size: float = 0.1, val_size: float = 0.1
     Returns:
         X_train, y_train, X_val, y_val, X_test, y_test, scaler
     """
+    # 检查路径是文件还是目录
+    if os.path.isdir(file_path):
+        # 如果是目录，使用新的加载方式
+        data = prepare_data_for_training(
+            ppg_dir=file_path,
+            prv_dir=None,
+            test_size=test_size,
+            val_size=val_size
+        )
+        return (
+            data['X_ppg_train'], data['y_stress_train'],
+            data['X_ppg_val'], data['y_stress_val'],
+            data['X_ppg_test'], data['y_stress_test'],
+            data.get('ppg_scaler', None)
+        )
+    
+    # 原有的单文件加载逻辑
     try:
         data = pd.read_csv(file_path, header=None, skiprows=1)
     except Exception as e:
@@ -250,16 +546,39 @@ def load_ppg_data(file_path: str, test_size: float = 0.1, val_size: float = 0.1
 def load_prv_data(file_path: str, test_size: float = 0.1, val_size: float = 0.1
                   ) -> Tuple[np.ndarray, ...]:
     """
-    加载PRV数据
+    加载PRV数据（向后兼容）
     
     Args:
-        file_path: 数据文件路径
+        file_path: 数据文件路径或目录
         test_size: 测试集比例
         val_size: 验证集比例
     
     Returns:
         X_train, y_train, X_val, y_val, X_test, y_test, scaler
     """
+    # 检查路径是文件还是目录
+    if os.path.isdir(file_path):
+        # 如果是目录，使用新的加载方式
+        features, stress_labels, emotion_labels = load_emotion_data_from_folder(
+            file_path, "PRV", None
+        )
+        
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        
+        split_result = split_data_by_emotion(
+            features_scaled, stress_labels, emotion_labels,
+            test_size, val_size
+        )
+        
+        return (
+            split_result['X_train'], split_result['y_stress_train'],
+            split_result['X_val'], split_result['y_stress_val'],
+            split_result['X_test'], split_result['y_stress_test'],
+            scaler
+        )
+    
+    # 原有的单文件加载逻辑
     try:
         data = pd.read_csv(file_path)
     except Exception as e:
@@ -482,7 +801,7 @@ def load_model(model: torch.nn.Module, load_path: str, device: str = 'cpu'):
 
 # ============ 评估指标计算 ============
 def calculate_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
-    """计算评估指标"""
+    """计算回归评估指标"""
     predictions = np.array(predictions).flatten()
     targets = np.array(targets).flatten()
     
@@ -504,4 +823,60 @@ def calculate_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str,
         'mse': mse,
         'r2': r2,
         'correlation': correlation
+    }
+
+
+def calculate_classification_metrics(predictions: np.ndarray, targets: np.ndarray,
+                                      num_classes: int = 5) -> Dict[str, Any]:
+    """
+    计算分类评估指标
+    
+    Args:
+        predictions: 预测标签
+        targets: 真实标签
+        num_classes: 类别数
+    
+    Returns:
+        包含各种分类指标的字典
+    """
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score,
+        confusion_matrix, classification_report
+    )
+    
+    predictions = np.array(predictions).flatten()
+    targets = np.array(targets).flatten()
+    
+    accuracy = accuracy_score(targets, predictions)
+    
+    # 宏平均指标
+    precision_macro = precision_score(targets, predictions, average='macro', zero_division=0)
+    recall_macro = recall_score(targets, predictions, average='macro', zero_division=0)
+    f1_macro = f1_score(targets, predictions, average='macro', zero_division=0)
+    
+    # 加权平均指标
+    precision_weighted = precision_score(targets, predictions, average='weighted', zero_division=0)
+    recall_weighted = recall_score(targets, predictions, average='weighted', zero_division=0)
+    f1_weighted = f1_score(targets, predictions, average='weighted', zero_division=0)
+    
+    # 混淆矩阵
+    cm = confusion_matrix(targets, predictions, labels=list(range(num_classes)))
+    
+    # 每个类别的指标
+    per_class_precision = precision_score(targets, predictions, average=None, zero_division=0)
+    per_class_recall = recall_score(targets, predictions, average=None, zero_division=0)
+    per_class_f1 = f1_score(targets, predictions, average=None, zero_division=0)
+    
+    return {
+        'accuracy': accuracy,
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'f1_macro': f1_macro,
+        'precision_weighted': precision_weighted,
+        'recall_weighted': recall_weighted,
+        'f1_weighted': f1_weighted,
+        'confusion_matrix': cm.tolist(),
+        'per_class_precision': per_class_precision.tolist(),
+        'per_class_recall': per_class_recall.tolist(),
+        'per_class_f1': per_class_f1.tolist()
     }

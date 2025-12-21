@@ -699,8 +699,76 @@ class DualStreamFusion(nn.Module):
 
 
 # ============================================================
-# 第五部分：多任务学习头
+# 第五部分：任务学习头
 # ============================================================
+
+class RegressionHead(nn.Module):
+    """
+    压力回归头
+    
+    用于单任务压力回归，将特征维度转换为输出维度
+    """
+    
+    def __init__(self, d_model: int, output_dim: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.output_dim = output_dim
+        
+        # 回归层：将d_model维度转换为output_dim
+        self.regressor = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, output_dim)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch_size, d_model]
+        Returns:
+            [batch_size, output_dim]
+        """
+        return self.regressor(x)
+    
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算MSE损失"""
+        return F.mse_loss(pred.squeeze(), target.squeeze())
+
+
+class ClassificationHead(nn.Module):
+    """
+    情绪分类头
+    
+    用于单任务情绪分类，将特征维度转换为类别数
+    """
+    
+    def __init__(self, d_model: int, num_classes: int = 5, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_classes = num_classes
+        
+        # 分类层：将d_model维度转换为num_classes
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch_size, d_model]
+        Returns:
+            [batch_size, num_classes]
+        """
+        return self.classifier(x)
+    
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算交叉熔损失"""
+        return F.cross_entropy(pred, target)
+
 
 class MultiTaskHead(nn.Module):
     """
@@ -822,19 +890,23 @@ class PPGFormer(nn.Module):
     """
     PPG-Former: 单流PPG信号模型
     
-    可作为基准模型与其他模型对比
+    支持回归和分类任务，可作为基准模型与其他模型对比
     """
     
     def __init__(self, input_dim: int = 1, output_dim: int = 1,
                  d_model: int = 128, n_heads: int = 8, d_ff: int = 512,
-                 num_layers: int = 3, scales: list = [1, 3, 5, 7],
-                 dropout: float = 0.1,
+                 num_layers: int = 3, num_classes: int = 5,
+                 scales: list = [1, 3, 5, 7], dropout: float = 0.1,
+                 task_type: str = "regression",  # regression/classification/multi_task
                  use_physiological_pe: bool = True,
                  use_multi_scale_conv: bool = True,
                  use_time_freq_attention: bool = True,
                  use_freq_attention: bool = True,
-                 use_stress_gating: bool = True):
+                 use_stress_gating: bool = True,
+                 use_uncertainty_weighting: bool = True):
         super().__init__()
+        
+        self.task_type = task_type
         
         self.encoder = PPGFormerEncoder(
             input_dim=input_dim,
@@ -851,12 +923,15 @@ class PPGFormer(nn.Module):
             use_stress_gating=use_stress_gating
         )
         
-        self.regressor = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, output_dim)
-        )
+        # 根据任务类型创建相应的头
+        if task_type == "regression":
+            self.task_head = RegressionHead(d_model, output_dim, dropout)
+        elif task_type == "classification":
+            self.task_head = ClassificationHead(d_model, num_classes, dropout)
+        else:  # multi_task
+            self.task_head = MultiTaskHead(
+                d_model, num_classes, dropout, use_uncertainty_weighting
+            )
     
     def forward(self, src: torch.Tensor, tgt: torch.Tensor = None) -> torch.Tensor:
         """
@@ -864,7 +939,9 @@ class PPGFormer(nn.Module):
             src: [batch_size, seq_len, input_dim]
             tgt: 仅为兼容接口，不使用
         Returns:
-            [batch_size, 1, output_dim]
+            回归: [batch_size, 1]
+            分类: [batch_size, num_classes]
+            多任务: (stress_pred, emotion_pred)
         """
         # 编码
         x = self.encoder(src)
@@ -872,10 +949,36 @@ class PPGFormer(nn.Module):
         # 全局平均池化
         x = x.mean(dim=1)
         
-        # 回归
-        output = self.regressor(x)
+        # 任务头
+        output = self.task_head(x)
         
-        return output.unsqueeze(1)
+        if self.task_type == "multi_task":
+            return output  # (stress_pred, emotion_pred)
+        elif self.task_type == "regression":
+            return output.unsqueeze(1)  # [batch_size, 1, 1]
+        else:  # classification
+            return output  # [batch_size, num_classes]
+    
+    def compute_loss(self, src: torch.Tensor, stress_target: torch.Tensor = None,
+                     emotion_target: torch.Tensor = None) -> tuple:
+        """计算损失"""
+        x = self.encoder(src)
+        x = x.mean(dim=1)
+        
+        if self.task_type == "regression":
+            pred = self.task_head(x)
+            loss = self.task_head.compute_loss(pred, stress_target)
+            return loss, loss, torch.tensor(0.0)
+        elif self.task_type == "classification":
+            pred = self.task_head(x)
+            loss = self.task_head.compute_loss(pred, emotion_target)
+            return loss, torch.tensor(0.0), loss
+        else:  # multi_task
+            stress_pred, emotion_pred = self.task_head(x)
+            total_loss, stress_loss, emotion_loss = self.task_head.compute_loss(
+                stress_pred, stress_target, emotion_pred, emotion_target
+            )
+            return total_loss, stress_loss, emotion_loss
 
 
 class PPGFormerDualStream(nn.Module):
@@ -983,6 +1086,82 @@ class PPGFormerDualStream(nn.Module):
         )
         
         return total_loss, stress_loss, emotion_loss
+
+
+class PRVModel(nn.Module):
+    """
+    PRV独立模型
+    
+    支持回归和分类任务，用于单独使用PRV进行训练
+    """
+    
+    def __init__(self, input_dim: int = 1, output_dim: int = 1,
+                 d_model: int = 128, n_heads: int = 8,
+                 num_layers: int = 2, num_classes: int = 5,
+                 dropout: float = 0.1, task_type: str = "regression",
+                 use_uncertainty_weighting: bool = True):
+        super().__init__()
+        
+        self.task_type = task_type
+        
+        self.encoder = PRVEncoder(
+            input_dim=input_dim,
+            d_model=d_model,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        
+        # 根据任务类型创建相应的头
+        if task_type == "regression":
+            self.task_head = RegressionHead(d_model, output_dim, dropout)
+        elif task_type == "classification":
+            self.task_head = ClassificationHead(d_model, num_classes, dropout)
+        else:  # multi_task
+            self.task_head = MultiTaskHead(
+                d_model, num_classes, dropout, use_uncertainty_weighting
+            )
+    
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            src: [batch_size, seq_len, input_dim]
+            tgt: 仅为兼容接口，不使用
+        Returns:
+            回归: [batch_size, 1]
+            分类: [batch_size, num_classes]
+            多任务: (stress_pred, emotion_pred)
+        """
+        x = self.encoder(src)
+        x = x.mean(dim=1)
+        output = self.task_head(x)
+        
+        if self.task_type == "multi_task":
+            return output
+        elif self.task_type == "regression":
+            return output.unsqueeze(1)
+        else:
+            return output
+    
+    def compute_loss(self, src: torch.Tensor, stress_target: torch.Tensor = None,
+                     emotion_target: torch.Tensor = None) -> tuple:
+        """计算损失"""
+        x = self.encoder(src)
+        x = x.mean(dim=1)
+        
+        if self.task_type == "regression":
+            pred = self.task_head(x)
+            loss = self.task_head.compute_loss(pred, stress_target)
+            return loss, loss, torch.tensor(0.0)
+        elif self.task_type == "classification":
+            pred = self.task_head(x)
+            loss = self.task_head.compute_loss(pred, emotion_target)
+            return loss, torch.tensor(0.0), loss
+        else:  # multi_task
+            stress_pred, emotion_pred = self.task_head(x)
+            total_loss, stress_loss, emotion_loss = self.task_head.compute_loss(
+                stress_pred, stress_target, emotion_pred, emotion_target
+            )
+            return total_loss, stress_loss, emotion_loss
 
 
 class DualStreamOnly(nn.Module):
@@ -1094,6 +1273,7 @@ def create_model(model_name: str, config=None, **kwargs):
     """
     models = {
         'ppg_former': PPGFormer,
+        'prv_model': PRVModel,
         'ppg_former_dual_stream': PPGFormerDualStream,
         'dual_stream_only': DualStreamOnly,
         'lstm': LSTMBaseline,
@@ -1106,6 +1286,9 @@ def create_model(model_name: str, config=None, **kwargs):
     model_class = models[model_name.lower()]
     
     if config is not None:
+        # 获取任务类型
+        task_type = getattr(config.training, 'task_type', 'regression')
+        
         # 从配置创建模型
         if model_name.lower() == 'ppg_former_dual_stream':
             return model_class(
@@ -1135,13 +1318,528 @@ def create_model(model_name: str, config=None, **kwargs):
                 n_heads=config.model.n_heads,
                 d_ff=config.model.d_ff,
                 num_layers=config.model.ppg_layers,
+                num_classes=config.model.num_emotions,
                 scales=config.model.scales,
                 dropout=config.model.dropout,
+                task_type=task_type,
                 use_physiological_pe=config.ablation.use_physiological_pe,
                 use_multi_scale_conv=config.ablation.use_multi_scale_conv,
                 use_time_freq_attention=config.ablation.use_time_freq_attention,
                 use_freq_attention=config.ablation.use_freq_attention,
-                use_stress_gating=config.ablation.use_stress_gating
+                use_stress_gating=config.ablation.use_stress_gating,
+                use_uncertainty_weighting=config.ablation.use_uncertainty_weighting
+            )
+        elif model_name.lower() == 'prv_model':
+            return model_class(
+                input_dim=config.model.prv_input_dim,
+                d_model=config.model.d_model,
+                n_heads=config.model.n_heads,
+                num_layers=config.model.prv_layers,
+                num_classes=config.model.num_emotions,
+                dropout=config.model.dropout,
+                task_type=task_type,
+                use_uncertainty_weighting=config.ablation.use_uncertainty_weighting
             )
     
     return model_class(**kwargs)
+
+
+def get_model_for_train_mode(config) -> tuple:
+    """
+    根据训练模式获取相应的模型
+    
+    Args:
+        config: 实验配置
+    
+    Returns:
+        (model_class, model_name)
+    """
+    train_mode = config.training.train_mode
+    task_type = config.training.task_type
+    
+    mode_model_map = {
+        'ppg_only': ('ppg_former', 'PPGFormer'),
+        'prv_only': ('prv_model', 'PRVModel'),
+        'ppg_regression': ('ppg_former', 'PPGFormer'),
+        'prv_regression': ('prv_model', 'PRVModel'),
+        'ppg_classification': ('ppg_former', 'PPGFormer'),
+        'prv_classification': ('prv_model', 'PRVModel'),
+        'dual_stream': ('ppg_former_dual_stream', 'PPGFormerDualStream'),
+        'multi_task': ('ppg_former_dual_stream', 'PPGFormerDualStream'),
+    }
+    
+    if train_mode not in mode_model_map:
+        raise ValueError(f"未知训练模式: {train_mode}")
+    
+    model_key, model_name = mode_model_map[train_mode]
+    model = create_model(model_key, config)
+    
+    return model, model_name
+
+
+# ============================================================
+# 第七部分：基准模型包装器（支持回归/分类任务）
+# ============================================================
+
+class Chomp1d(nn.Module):
+    """用于TCN的序列裁剪模块"""
+    def __init__(self, padding):
+        super(Chomp1d, self).__init__()
+        self.padding = padding
+
+    def forward(self, x):
+        return x[:, :, :-self.padding] if self.padding > 0 else x
+
+
+class TemporalBlock(nn.Module):
+    """TCN的时序块"""
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
+        super(TemporalBlock, self).__init__()
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1, 
+                                self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class BaselineModelWrapper(nn.Module):
+    """
+    基准模型通用包装器
+    
+    支持为基准模型添加回归或分类头，使其支持四种单任务训练模式
+    """
+    
+    def __init__(self, backbone: nn.Module, hidden_dim: int, 
+                 task_type: str = 'regression', num_classes: int = 5,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.backbone = backbone
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        
+        # 根据任务类型创建头
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+        elif task_type == 'classification':
+            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+        else:
+            raise ValueError(f"未知任务类型: {task_type}")
+    
+    def forward(self, src, tgt=None):
+        """
+        Args:
+            src: [batch_size, seq_len, input_dim]
+        Returns:
+            回归: [batch_size, 1]
+            分类: [batch_size, num_classes]
+        """
+        # 使用backbone提取特征
+        out = self.backbone(src, tgt)  # [batch_size, 1, hidden_dim] 或 [batch_size, 1, output_dim]
+        
+        # 如果backbone输出是三维的，取最后一个时间步
+        if out.dim() == 3:
+            out = out.squeeze(1)  # [batch_size, hidden_dim]
+        
+        # 通过任务头
+        output = self.task_head(out)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)  # [batch_size, 1, 1]
+        else:
+            return output  # [batch_size, num_classes]
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        """计算损失"""
+        output = self.forward(src)
+        
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class LSTMModel(nn.Module):
+    """
+    LSTM基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 num_layers: int = 2, num_classes: int = 5,
+                 dropout: float = 0.1, task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
+                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
+        c0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
+        
+        out, _ = self.lstm(src, (h0, c0))
+        out = out[:, -1, :]  # 取最后一个时间步
+        
+        output = self.task_head(out)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class GRUModel(nn.Module):
+    """
+    GRU基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 num_layers: int = 2, num_classes: int = 5,
+                 dropout: float = 0.1, task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers,
+                         batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
+        
+        out, _ = self.gru(src, h0)
+        out = out[:, -1, :]
+        
+        output = self.task_head(out)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class BiLSTMModel(nn.Module):
+    """
+    双向LSTM基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 num_layers: int = 2, num_classes: int = 5,
+                 dropout: float = 0.1, task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
+                           batch_first=True, bidirectional=True,
+                           dropout=dropout if num_layers > 1 else 0)
+        
+        # 双向，所以输出维度是hidden_dim * 2
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim * 2, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim * 2, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        h0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).to(src.device)
+        c0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).to(src.device)
+        
+        out, _ = self.lstm(src, (h0, c0))
+        out = out[:, -1, :]
+        
+        output = self.task_head(out)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class TCNModel(nn.Module):
+    """
+    TCN（时序卷积网络）基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 num_layers: int = 4, num_classes: int = 5,
+                 kernel_size: int = 3, dropout: float = 0.2,
+                 task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        
+        # 创建通道列表
+        num_channels = [hidden_dim] * num_layers
+        
+        layers = []
+        for i in range(num_layers):
+            dilation_size = 2 ** i
+            in_channels = input_dim if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers.append(TemporalBlock(
+                in_channels, out_channels, kernel_size,
+                stride=1, dilation=dilation_size,
+                padding=(kernel_size-1) * dilation_size,
+                dropout=dropout
+            ))
+        
+        self.network = nn.Sequential(*layers)
+        
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        # src: [batch_size, seq_len, input_dim]
+        src = src.transpose(1, 2)  # [batch_size, input_dim, seq_len]
+        out = self.network(src)
+        out = out[:, :, -1]  # 取最后一个时间步
+        
+        output = self.task_head(out)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class TransformerModel(nn.Module):
+    """
+    Transformer基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 n_heads: int = 8, num_layers: int = 3,
+                 num_classes: int = 5, dropout: float = 0.1,
+                 task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        # 输入投影
+        x = self.input_projection(src)
+        
+        # Transformer编码
+        x = self.encoder(x)
+        
+        # 取最后一个时间步或平均池化
+        x = x.mean(dim=1)
+        
+        output = self.task_head(x)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+class InformerModel(nn.Module):
+    """
+    Informer基准模型，支持回归和分类任务
+    """
+    def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
+                 n_heads: int = 8, num_layers: int = 3,
+                 num_classes: int = 5, dropout: float = 0.1,
+                 task_type: str = 'regression'):
+        super().__init__()
+        self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        # Informer风格的中间层
+        self.intermediate = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.activation = nn.ReLU()
+        
+        if task_type == 'regression':
+            self.task_head = RegressionHead(hidden_dim // 2, 1, dropout)
+        else:
+            self.task_head = ClassificationHead(hidden_dim // 2, num_classes, dropout)
+    
+    def forward(self, src, tgt=None):
+        # 输入投影
+        x = self.input_projection(src) * math.sqrt(self.hidden_dim)
+        
+        # Transformer编码
+        x = self.encoder(x)
+        
+        # 取最后一个时间步
+        x = x[:, -1, :]
+        
+        # 中间层
+        x = self.intermediate(x)
+        x = self.activation(x)
+        
+        output = self.task_head(x)
+        
+        if self.task_type == 'regression':
+            return output.unsqueeze(1)
+        return output
+    
+    def compute_loss(self, src, stress_target=None, emotion_target=None):
+        output = self.forward(src)
+        if self.task_type == 'regression':
+            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
+            return loss, loss, torch.tensor(0.0)
+        else:
+            loss = self.task_head.compute_loss(output, emotion_target)
+            return loss, torch.tensor(0.0), loss
+
+
+# 基准模型工厂函数
+BASELINE_MODELS = {
+    'lstm': LSTMModel,
+    'gru': GRUModel,
+    'bilstm': BiLSTMModel,
+    'tcn': TCNModel,
+    'transformer_baseline': TransformerModel,
+    'informer': InformerModel,
+}
+
+
+def create_baseline_model(model_name: str, input_dim: int = 1, hidden_dim: int = 128,
+                          num_layers: int = 2, num_classes: int = 5,
+                          dropout: float = 0.1, task_type: str = 'regression',
+                          **kwargs):
+    """
+    创建基准模型
+    
+    Args:
+        model_name: 模型名称 (lstm/gru/bilstm/tcn/transformer_baseline/informer)
+        input_dim: 输入维度
+        hidden_dim: 隐藏层维度
+        num_layers: 层数
+        num_classes: 分类类别数
+        dropout: dropout比例
+        task_type: 任务类型 (regression/classification)
+    
+    Returns:
+        模型实例
+    """
+    if model_name.lower() not in BASELINE_MODELS:
+        raise ValueError(f"未知基准模型: {model_name}. 可用模型: {list(BASELINE_MODELS.keys())}")
+    
+    model_class = BASELINE_MODELS[model_name.lower()]
+    
+    # 根据模型类型传递不同的参数
+    if model_name.lower() in ['lstm', 'gru', 'bilstm']:
+        return model_class(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+            dropout=dropout,
+            task_type=task_type
+        )
+    elif model_name.lower() == 'tcn':
+        return model_class(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+            dropout=dropout,
+            task_type=task_type,
+            kernel_size=kwargs.get('kernel_size', 3)
+        )
+    else:  # transformer_baseline, informer
+        return model_class(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            n_heads=kwargs.get('n_heads', 8),
+            num_layers=num_layers,
+            num_classes=num_classes,
+            dropout=dropout,
+            task_type=task_type
+        )
+
+
+def list_available_models() -> list:
+    """列出所有可用模型"""
+    ppg_former_models = ['ppg_former', 'prv_model', 'ppg_former_dual_stream', 'dual_stream_only']
+    baseline_models = list(BASELINE_MODELS.keys())
+    return ppg_former_models + baseline_models

@@ -1,5 +1,4 @@
-"""
-PPG-Former-DualStream 评估器
+"""PPG-Former-DualStream 评估器
 包含模型评估、测试和结果分析功能
 """
 
@@ -12,10 +11,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import (
     mean_squared_error, mean_absolute_error, r2_score,
-    accuracy_score, f1_score, confusion_matrix, classification_report
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report
 )
 
-from utils import Logger, calculate_metrics
+from utils import Logger, calculate_metrics, calculate_classification_metrics
 
 
 class Evaluator:
@@ -23,22 +23,27 @@ class Evaluator:
     模型评估器
     
     支持：
-    1. 回归任务评估（压力预测）
-    2. 分类任务评估（情绪分类）
+    1. 回归任务评估（压力预测）- MAE, RMSE
+    2. 分类任务评估（情绪分类）- Accuracy, Precision, Recall, F1-Score
     3. 多任务评估
     4. 结果可视化
     """
     
-    def __init__(self, model: nn.Module, device: str = 'cpu', logger: Logger = None):
+    def __init__(self, model: nn.Module, device: str = 'cpu', logger: Logger = None,
+                 task_type: str = 'regression', train_mode: str = 'dual_stream'):
         """
         Args:
             model: 模型实例
             device: 设备
             logger: 日志记录器
+            task_type: 任务类型 (regression/classification/multi_task)
+            train_mode: 训练模式
         """
         self.model = model
         self.device = torch.device(device)
         self.logger = logger
+        self.task_type = task_type
+        self.train_mode = train_mode
         
         self.model.to(self.device)
         self.model.eval()
@@ -60,6 +65,8 @@ class Evaluator:
         """
         评估回归任务（压力预测）
         
+        评估指标：MAE, RMSE, R², 相关系数
+        
         Args:
             test_loader: 测试数据加载器
             return_predictions: 是否返回预测值
@@ -77,26 +84,18 @@ class Evaluator:
         with torch.no_grad():
             for batch_data in test_loader:
                 # 解析数据
-                if len(batch_data) >= 3:
-                    ppg_data = batch_data[0].to(self.device)
-                    prv_data = batch_data[1].to(self.device)
-                    stress_target = batch_data[2].to(self.device)
-                else:
-                    ppg_data = batch_data[0].to(self.device)
-                    stress_target = batch_data[1].to(self.device)
-                    prv_data = None
+                batch_info = self._parse_batch_data(batch_data)
+                input_data = batch_info['input_data']
+                stress_target = batch_info['stress_target']
+                prv_data = batch_info.get('prv_data', None)
                 
-                # 确保输入维度正确
-                if ppg_data.dim() == 2:
-                    ppg_data = ppg_data.unsqueeze(-1)
-                if prv_data is not None and prv_data.dim() == 2:
-                    prv_data = prv_data.unsqueeze(-1)
+                if stress_target is None:
+                    continue
                 
                 # 前向传播
-                if hasattr(self.model, 'compute_loss') and prv_data is not None:
-                    output, _ = self.model(ppg_data, prv_data)
-                else:
-                    output = self.model(ppg_data)
+                output = self._forward(input_data, prv_data)
+                if isinstance(output, tuple):
+                    output = output[0]  # 取压力预测
                 
                 # 计算损失
                 loss = self.mse_criterion(output.squeeze(), stress_target.squeeze())
@@ -115,6 +114,9 @@ class Evaluator:
                 
                 batch_count += 1
         
+        if batch_count == 0:
+            return {}
+        
         # 转换为numpy数组
         predictions = np.array(all_predictions)
         targets = np.array(all_targets)
@@ -124,7 +126,7 @@ class Evaluator:
         metrics = calculate_metrics(predictions, targets)
         metrics['loss'] = avg_loss
         
-        self._log(f"回归评估结果:")
+        self._log(f"\n===== 压力回归评估结果 =====")
         self._log(f"  Loss: {avg_loss:.4f}")
         self._log(f"  MAE: {metrics['mae']:.4f}")
         self._log(f"  RMSE: {metrics['rmse']:.4f}")
@@ -137,11 +139,70 @@ class Evaluator:
         
         return metrics
     
+    def _parse_batch_data(self, batch_data: tuple) -> dict:
+        """解析批次数据"""
+        result = {
+            'input_data': None,
+            'prv_data': None,
+            'stress_target': None,
+            'emotion_target': None
+        }
+        
+        if len(batch_data) == 4:
+            # PPG + PRV + stress + emotion 或 input + stress + emotion + extra
+            if self.train_mode in ['dual_stream', 'multi_task']:
+                ppg_data, prv_data, stress_target, emotion_target = batch_data
+                result['input_data'] = ppg_data.to(self.device)
+                result['prv_data'] = prv_data.to(self.device)
+                result['stress_target'] = stress_target.to(self.device)
+                result['emotion_target'] = emotion_target.to(self.device)
+            else:
+                input_data, stress_target, emotion_target, _ = batch_data
+                result['input_data'] = input_data.to(self.device)
+                result['stress_target'] = stress_target.to(self.device)
+                result['emotion_target'] = emotion_target.to(self.device)
+        elif len(batch_data) == 3:
+            if self.train_mode in ['dual_stream', 'multi_task']:
+                ppg_data, prv_data, stress_target = batch_data
+                result['input_data'] = ppg_data.to(self.device)
+                result['prv_data'] = prv_data.to(self.device)
+                result['stress_target'] = stress_target.to(self.device)
+            else:
+                input_data, stress_target, emotion_target = batch_data
+                result['input_data'] = input_data.to(self.device)
+                result['stress_target'] = stress_target.to(self.device)
+                if isinstance(emotion_target, torch.Tensor):
+                    result['emotion_target'] = emotion_target.to(self.device)
+        elif len(batch_data) == 2:
+            input_data, target = batch_data
+            result['input_data'] = input_data.to(self.device)
+            if self.task_type == 'classification':
+                result['emotion_target'] = target.to(self.device)
+            else:
+                result['stress_target'] = target.to(self.device)
+        
+        # 确保输入维度正确
+        if result['input_data'] is not None and result['input_data'].dim() == 2:
+            result['input_data'] = result['input_data'].unsqueeze(-1)
+        if result['prv_data'] is not None and result['prv_data'].dim() == 2:
+            result['prv_data'] = result['prv_data'].unsqueeze(-1)
+        
+        return result
+    
+    def _forward(self, input_data, prv_data):
+        """前向传播"""
+        if prv_data is not None and hasattr(self.model, 'compute_loss'):
+            return self.model(input_data, prv_data)
+        else:
+            return self.model(input_data)
+    
     def evaluate_classification(self, test_loader: DataLoader,
                                 emotion_labels: List[str] = None
                                 ) -> Dict[str, Any]:
         """
         评估分类任务（情绪分类）
+        
+        评估指标：Accuracy, Precision, Recall, F1-Score
         
         Args:
             test_loader: 测试数据加载器
@@ -162,20 +223,21 @@ class Evaluator:
         
         with torch.no_grad():
             for batch_data in test_loader:
-                if len(batch_data) < 4:
+                # 解析数据
+                batch_info = self._parse_batch_data(batch_data)
+                input_data = batch_info['input_data']
+                emotion_target = batch_info['emotion_target']
+                prv_data = batch_info.get('prv_data', None)
+                
+                if emotion_target is None:
                     continue
                 
-                ppg_data = batch_data[0].to(self.device)
-                prv_data = batch_data[1].to(self.device)
-                emotion_target = batch_data[3].to(self.device)
-                
-                if ppg_data.dim() == 2:
-                    ppg_data = ppg_data.unsqueeze(-1)
-                if prv_data.dim() == 2:
-                    prv_data = prv_data.unsqueeze(-1)
-                
                 # 前向传播
-                _, emotion_pred = self.model(ppg_data, prv_data)
+                output = self._forward(input_data, prv_data)
+                if isinstance(output, tuple):
+                    emotion_pred = output[1]  # 取情绪预测
+                else:
+                    emotion_pred = output  # 单任务分类
                 
                 # 计算损失
                 loss = self.ce_criterion(emotion_pred, emotion_target)
@@ -200,8 +262,14 @@ class Evaluator:
         # 计算评估指标
         avg_loss = total_loss / batch_count
         accuracy = accuracy_score(targets, predictions)
-        f1_macro = f1_score(targets, predictions, average='macro')
-        f1_weighted = f1_score(targets, predictions, average='weighted')
+        
+        # Precision, Recall, F1
+        precision_macro = precision_score(targets, predictions, average='macro', zero_division=0)
+        precision_weighted = precision_score(targets, predictions, average='weighted', zero_division=0)
+        recall_macro = recall_score(targets, predictions, average='macro', zero_division=0)
+        recall_weighted = recall_score(targets, predictions, average='weighted', zero_division=0)
+        f1_macro = f1_score(targets, predictions, average='macro', zero_division=0)
+        f1_weighted = f1_score(targets, predictions, average='weighted', zero_division=0)
         
         # 混淆矩阵
         cm = confusion_matrix(targets, predictions)
@@ -210,23 +278,40 @@ class Evaluator:
         report = classification_report(
             targets, predictions,
             target_names=emotion_labels,
-            output_dict=True
+            output_dict=True,
+            zero_division=0
         )
         
         metrics = {
             'loss': avg_loss,
             'accuracy': accuracy,
+            'precision_macro': precision_macro,
+            'precision_weighted': precision_weighted,
+            'recall_macro': recall_macro,
+            'recall_weighted': recall_weighted,
             'f1_macro': f1_macro,
             'f1_weighted': f1_weighted,
             'confusion_matrix': cm.tolist(),
-            'classification_report': report
+            'classification_report': report,
+            'predictions': predictions.tolist(),
+            'targets': targets.tolist()
         }
         
-        self._log(f"分类评估结果:")
+        self._log(f"\n===== 情绪分类评估结果 =====")
         self._log(f"  Loss: {avg_loss:.4f}")
         self._log(f"  Accuracy: {accuracy:.4f}")
-        self._log(f"  F1 (macro): {f1_macro:.4f}")
-        self._log(f"  F1 (weighted): {f1_weighted:.4f}")
+        self._log(f"  Precision (macro): {precision_macro:.4f}")
+        self._log(f"  Recall (macro): {recall_macro:.4f}")
+        self._log(f"  F1-Score (macro): {f1_macro:.4f}")
+        self._log(f"  F1-Score (weighted): {f1_weighted:.4f}")
+        
+        # 打印每个类别的指标
+        self._log(f"\n  各类别详细指标:")
+        for i, label in enumerate(emotion_labels):
+            if label in report:
+                self._log(f"    {label}: Precision={report[label]['precision']:.4f}, "
+                         f"Recall={report[label]['recall']:.4f}, "
+                         f"F1={report[label]['f1-score']:.4f}")
         
         return metrics
     
