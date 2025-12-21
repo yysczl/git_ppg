@@ -569,11 +569,11 @@ def train_mode_func(args, config: ExperimentConfig):
     best_model.to(device)
     
     # 保存模型
-    model_save_path = os.path.join(
-        config.log.model_save_dir,
-        f"{model_name}_{train_mode}_{logger.timestamp}.pth"
-    )
-    save_model(best_model, model_save_path, config)
+    # model_save_path = os.path.join(
+    #     config.log.model_save_dir,
+    #     f"{model_name}_{train_mode}_{logger.timestamp}.pth"
+    # )
+    # save_model(best_model, model_save_path, config)
     
     # 保存日志
     logger.save_history()

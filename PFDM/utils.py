@@ -277,7 +277,13 @@ def load_emotion_data_from_folder(data_dir: str, signal_type: str = "PPG",
             all_features.append(features)
             all_stress_labels.append(stress_labels)
             all_emotion_labels.append(emotion_labels)
-            
+    
+            # 打印训练数据和标签的前五行
+            print(f"\n{emotion} {signal_type}数据加载完成:")
+            print(f"  前五行特征: {features[:5,:5]}")
+            print(f"  压力标签: {stress_labels[:5]}")
+            print(f"  情绪标签: {emotion_labels[:5]}")
+        
         except Exception as e:
             print(f"读取文件出错 {file_path}: {e}")
             continue

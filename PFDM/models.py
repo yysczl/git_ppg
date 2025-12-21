@@ -1469,149 +1469,205 @@ class BaselineModelWrapper(nn.Module):
 class LSTMModel(nn.Module):
     """
     LSTM基准模型，支持回归和分类任务
+    
+    与informer-prv中的LSTM模型保持一致：
+    - 直接使用nn.Linear输出，不使用任务头包装
+    - 隐藏状态使用requires_grad_()和detach()初始化
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  num_layers: int = 2, num_classes: int = 5,
                  dropout: float = 0.1, task_type: str = 'regression'):
         super().__init__()
-        self.task_type = task_type
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.task_type = task_type
+        self.num_classes = num_classes
         
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, 
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        # LSTM网络层
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         
+        # 根据任务类型设置输出层（与informer-prv一致，直接用全连接层）
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+            self.output_dim = 1
+            self.fc = nn.Linear(hidden_dim, self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+            self.output_dim = num_classes
+            self.fc = nn.Linear(hidden_dim, num_classes)
     
     def forward(self, src, tgt=None):
-        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
-        c0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
+        # src: [batch_size, seq_len, input_dim]
+        # tgt: 仅为了与Informer接口兼容，实际不使用
         
-        out, _ = self.lstm(src, (h0, c0))
-        out = out[:, -1, :]  # 取最后一个时间步
+        # 初始化隐藏状态和细胞状态（与informer-prv一致）
+        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).requires_grad_().to(src.device)
+        c0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).requires_grad_().to(src.device)
         
-        output = self.task_head(out)
+        # 前向传播LSTM，返回输出和最新的隐藏状态与细胞状态
+        out, (hn, cn) = self.lstm(src, (h0.detach(), c0.detach()))
+        
+        # 将LSTM的最后一个时间步的输出通过全连接层
+        out = self.fc(out[:, -1, :])
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
-        return output
+            # 增加一个维度以匹配Informer的输出格式
+            out = out.unsqueeze(1)
+        
+        return out
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 class GRUModel(nn.Module):
     """
     GRU基准模型，支持回归和分类任务
+    
+    与informer-prv中的GRU模型保持一致：
+    - 直接使用nn.Linear输出
+    - 隐藏状态使用requires_grad_()和detach()初始化
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  num_layers: int = 2, num_classes: int = 5,
                  dropout: float = 0.1, task_type: str = 'regression'):
         super().__init__()
-        self.task_type = task_type
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.task_type = task_type
+        self.num_classes = num_classes
         
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers,
-                         batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        # GRU网络层
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers, batch_first=True)
         
+        # 根据任务类型设置输出层（与informer-prv一致）
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+            self.output_dim = 1
+            self.fc = nn.Linear(hidden_dim, self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+            self.output_dim = num_classes
+            self.fc = nn.Linear(hidden_dim, num_classes)
     
     def forward(self, src, tgt=None):
-        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).to(src.device)
+        # src: [batch_size, seq_len, input_dim]
+        # tgt: 仅为了与Informer接口兼容，实际不使用
         
-        out, _ = self.gru(src, h0)
-        out = out[:, -1, :]
+        # 初始化隐藏状态（与informer-prv一致）
+        h0 = torch.zeros(self.num_layers, src.size(0), self.hidden_dim).requires_grad_().to(src.device)
         
-        output = self.task_head(out)
+        # 前向传播GRU
+        out, hn = self.gru(src, h0.detach())
+        
+        # 将GRU的最后一个时间步的输出通过全连接层
+        out = self.fc(out[:, -1, :])
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
-        return output
+            # 增加一个维度以匹配Informer的输出格式
+            out = out.unsqueeze(1)
+        
+        return out
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 class BiLSTMModel(nn.Module):
     """
     双向LSTM基准模型，支持回归和分类任务
+    
+    与informer-prv中的BiLSTM模型保持一致：
+    - 直接使用nn.Linear输出
+    - 隐藏状态使用requires_grad_()和detach()初始化
+    - 输出维度为hidden_dim * 2（双向）
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  num_layers: int = 2, num_classes: int = 5,
                  dropout: float = 0.1, task_type: str = 'regression'):
         super().__init__()
-        self.task_type = task_type
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.task_type = task_type
+        self.num_classes = num_classes
         
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers,
-                           batch_first=True, bidirectional=True,
-                           dropout=dropout if num_layers > 1 else 0)
+        # 双向LSTM网络层
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, bidirectional=True)
         
-        # 双向，所以输出维度是hidden_dim * 2
+        # 注意：因为是双向，所以全连接层的输入是 hidden_dim * 2
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim * 2, 1, dropout)
+            self.output_dim = 1
+            self.fc = nn.Linear(hidden_dim * 2, self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim * 2, num_classes, dropout)
+            self.output_dim = num_classes
+            self.fc = nn.Linear(hidden_dim * 2, num_classes)
     
     def forward(self, src, tgt=None):
-        h0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).to(src.device)
-        c0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).to(src.device)
+        # src: [batch_size, seq_len, input_dim]
+        # tgt: 仅为了与Informer接口兼容，实际不使用
         
-        out, _ = self.lstm(src, (h0, c0))
-        out = out[:, -1, :]
+        # 初始化隐藏状态和细胞状态（与informer-prv一致）
+        h0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).requires_grad_().to(src.device)
+        c0 = torch.zeros(self.num_layers * 2, src.size(0), self.hidden_dim).requires_grad_().to(src.device)
         
-        output = self.task_head(out)
+        # 前向传播双向LSTM
+        out, (hn, cn) = self.lstm(src, (h0.detach(), c0.detach()))
+        
+        # 取双向的最后一个时间步的输出
+        out = self.fc(out[:, -1, :])
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
-        return output
+            # 增加一个维度以匹配Informer的输出格式
+            out = out.unsqueeze(1)
+        
+        return out
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 class TCNModel(nn.Module):
     """
     TCN（时序卷积网络）基准模型，支持回归和分类任务
+    
+    与informer-prv中的TemporalConvNet模型保持一致：
+    - 使用[64, 64, 128, 128]通道配置
+    - 直接使用nn.Linear输出
+    - dropout=0.1
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  num_layers: int = 4, num_classes: int = 5,
-                 kernel_size: int = 3, dropout: float = 0.2,
+                 kernel_size: int = 3, dropout: float = 0.1,
                  task_type: str = 'regression'):
         super().__init__()
+        self.input_dim = input_dim
         self.task_type = task_type
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
         
-        # 创建通道列表
-        num_channels = [hidden_dim] * num_layers
+        # 与informer-prv一致的通道配置
+        num_channels = [64, 64, 128, 128]
         
         layers = []
-        for i in range(num_layers):
+        num_levels = len(num_channels)
+        for i in range(num_levels):
             dilation_size = 2 ** i
             in_channels = input_dim if i == 0 else num_channels[i-1]
             out_channels = num_channels[i]
@@ -1624,143 +1680,189 @@ class TCNModel(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
+        # 直接使用全连接层（与informer-prv一致）
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+            self.output_dim = 1
+            self.fc = nn.Linear(num_channels[-1], self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+            self.output_dim = num_classes
+            self.fc = nn.Linear(num_channels[-1], num_classes)
     
     def forward(self, src, tgt=None):
         # src: [batch_size, seq_len, input_dim]
-        src = src.transpose(1, 2)  # [batch_size, input_dim, seq_len]
-        out = self.network(src)
-        out = out[:, :, -1]  # 取最后一个时间步
+        # tgt: 仅为了与Informer接口兼容，实际不使用
         
-        output = self.task_head(out)
+        src = src.transpose(1, 2)  # 将 batch_size, seq_len, input_dim 转换为 batch_size, input_dim, seq_len
+        out = self.network(src)
+        out = out[:, :, -1]  # 选择每个序列的最后一个输出
+        out = self.fc(out)
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
-        return output
+            # 增加一个维度以匹配Informer的输出格式
+            out = out.unsqueeze(1)
+        
+        return out
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 class TransformerModel(nn.Module):
     """
     Transformer基准模型，支持回归和分类任务
+    
+    与informer-prv中的TimeSeriesTransformer模型保持一致：
+    - 取最后时间步输出（而非mean池化）
+    - 直接使用nn.Linear输出
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  n_heads: int = 8, num_layers: int = 3,
                  num_classes: int = 5, dropout: float = 0.1,
                  task_type: str = 'regression'):
         super().__init__()
+        self.input_dim = input_dim
         self.task_type = task_type
         self.hidden_dim = hidden_dim
+        self.num_heads = n_heads
+        self.num_layers = num_layers
+        self.num_classes = num_classes
         
-        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        # 输入投影层
+        self.transform_layer = nn.Linear(input_dim, hidden_dim)
         
+        # Transformer 的 Encoder 部分
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout, batch_first=True
+            dropout=dropout
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
+        # 输出层（与informer-prv一致，直接用全连接层）
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim, 1, dropout)
+            self.output_dim = 1
+            self.output_layer = nn.Linear(hidden_dim, self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim, num_classes, dropout)
+            self.output_dim = num_classes
+            self.output_layer = nn.Linear(hidden_dim, num_classes)
     
     def forward(self, src, tgt=None):
-        # 输入投影
-        x = self.input_projection(src)
+        # src: [batch_size, seq_len, input_dim]
+        # tgt: 仅为了与Informer接口兼容，实际不使用
         
-        # Transformer编码
-        x = self.encoder(x)
+        # 转换输入数据维度以符合 Transformer 的要求：(seq_len, batch_size, feature_dim)
+        src = src.permute(1, 0, 2)
+        src = self.transform_layer(src)
         
-        # 取最后一个时间步或平均池化
-        x = x.mean(dim=1)
+        # Transformer 编码器
+        out = self.transformer_encoder(src)
         
-        output = self.task_head(x)
+        # 取最后一个时间步的输出（与informer-prv一致）
+        out = out[-1, :, :]
+        
+        # 全连接层生成最终输出
+        out = self.output_layer(out)
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
-        return output
+            # 增加一个维度以匹配Informer的输出格式
+            out = out.unsqueeze(1)
+        
+        return out
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 class InformerModel(nn.Module):
     """
     Informer基准模型，支持回归和分类任务
+    
+    与informer-prv中的Informer模型保持一致：
+    - 有intermediate层（d_model → d_model//2）
+    - 使用sqrt(d_model)缩放
+    - 取最后一个时间步输出
+    - d_ff = 512
     """
     def __init__(self, input_dim: int = 1, hidden_dim: int = 128,
                  n_heads: int = 8, num_layers: int = 3,
                  num_classes: int = 5, dropout: float = 0.1,
                  task_type: str = 'regression'):
         super().__init__()
+        self.input_dim = input_dim
         self.task_type = task_type
         self.hidden_dim = hidden_dim
+        self.d_model = hidden_dim
+        self.num_classes = num_classes
         
+        # 输入投影层
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         
+        # 使用与informer-prv一致的d_ff=512
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=512,
             dropout=dropout, batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
-        # Informer风格的中间层
+        # Informer风格的中间层（与informer-prv一致）
         self.intermediate = nn.Linear(hidden_dim, hidden_dim // 2)
         self.activation = nn.ReLU()
         
+        # 输出投影层（直接用全连接层）
         if task_type == 'regression':
-            self.task_head = RegressionHead(hidden_dim // 2, 1, dropout)
+            self.output_dim = 1
+            self.projection = nn.Linear(hidden_dim // 2, self.output_dim)
         else:
-            self.task_head = ClassificationHead(hidden_dim // 2, num_classes, dropout)
+            self.output_dim = num_classes
+            self.projection = nn.Linear(hidden_dim // 2, num_classes)
     
     def forward(self, src, tgt=None):
-        # 输入投影
-        x = self.input_projection(src) * math.sqrt(self.hidden_dim)
+        # src: [batch_size, seq_len, input_dim]
+        # tgt: 仅为了与接口兼容，实际不使用
         
-        # Transformer编码
-        x = self.encoder(x)
+        # 输入投影（与informer-prv一致，使用sqrt(d_model)缩放）
+        src_emb = self.input_projection(src)
+        src_emb = src_emb * math.sqrt(self.d_model)
         
-        # 取最后一个时间步
-        x = x[:, -1, :]
+        # 编码器前向传播
+        enc_output = self.encoder(src_emb)
         
-        # 中间层
-        x = self.intermediate(x)
-        x = self.activation(x)
+        # 取最后一个时间步的输出（与informer-prv一致）
+        enc_output = enc_output[:, -1, :]
         
-        output = self.task_head(x)
+        # 中间层处理（与informer-prv一致）
+        intermediate_output = self.intermediate(enc_output)
+        intermediate_output = self.activation(intermediate_output)
+        
+        # 最终输出
+        output = self.projection(intermediate_output)
         
         if self.task_type == 'regression':
-            return output.unsqueeze(1)
+            # 增加一个维度以匹配输出格式
+            output = output.unsqueeze(1)
+        
         return output
     
     def compute_loss(self, src, stress_target=None, emotion_target=None):
         output = self.forward(src)
         if self.task_type == 'regression':
-            loss = self.task_head.compute_loss(output.squeeze(), stress_target)
-            return loss, loss, torch.tensor(0.0)
+            loss = F.mse_loss(output.squeeze(), stress_target.squeeze())
+            return loss, loss, torch.tensor(0.0, device=src.device)
         else:
-            loss = self.task_head.compute_loss(output, emotion_target)
-            return loss, torch.tensor(0.0), loss
+            loss = F.cross_entropy(output, emotion_target)
+            return loss, torch.tensor(0.0, device=src.device), loss
 
 
 # 基准模型工厂函数

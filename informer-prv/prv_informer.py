@@ -40,7 +40,7 @@ def main():
     print(f"使用设备: {device}")
     
     # 定义模型类型和参数
-    model_type = "Informer"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
+    model_type = "LSTM"  # 可选: "Informer", "LSTM", "GRU", "BiLSTM", "TCN", "Transformer"
     
     # 根据模型类型设置模型参数
     if model_type == "Informer":
@@ -119,7 +119,7 @@ def main():
     
     # K折交叉验证训练
     k_folds = 5
-    num_epochs = 500
+    num_epochs = 300
     batch_size = 8
     
     fold_results, all_losses, best_model_states = train_model_kfold(

@@ -139,11 +139,12 @@ class Trainer:
             # 反向传播
             loss.backward()
             
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=self.config.training.max_grad_norm
-            )
+            # 梯度裁剪（可选）
+            if getattr(self.config.training, 'use_grad_clip', True):
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=self.config.training.max_grad_norm
+                )
             
             self.optimizer.step()
             

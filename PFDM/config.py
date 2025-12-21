@@ -42,14 +42,17 @@ class TaskType(Enum):
 
 @dataclass
 class BaselineModelConfig:
-    """基准模型配置"""
+    """基准模型配置
+    
+    与informer-prv保持一致的参数设置
+    """
     # 基准模型名称: lstm, gru, bilstm, tcn, transformer_baseline, informer
     model_name: str = "lstm"
     
-    # 通用参数
+    # 通用参数（与informer-prv一致）
     input_dim: int = 1
-    hidden_dim: int = 128
-    num_layers: int = 2
+    hidden_dim: int = 128  # 与informer-prv的d_model一致
+    num_layers: int = 2    # 与informer-prv的enc_layers一致
     num_classes: int = 5
     dropout: float = 0.1
     
@@ -83,22 +86,26 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    """训练配置"""
-    # 基础训练参数
-    num_epochs: int = 300
-    batch_size: int = 8
-    learning_rate: float = 0.0005
-    weight_decay: float = 1e-4
+    """训练配置
+    
+    与informer-prv保持一致的训练参数
+    """
+    # 基础训练参数（与informer-prv一致）
+    num_epochs: int = 300       # 从informer-prv: 300
+    batch_size: int = 4         # 从informer-prv: 8
+    learning_rate: float = 0.0005  # 从informer-prv: 0.0005
+    weight_decay: float = 1e-4  # 从informer-prv: 1e-4
     
     # K折交叉验证
-    k_folds: int = 5
+    k_folds: int = 5            # 从informer-prv: 5
     
-    # 学习率调度器
-    scheduler_factor: float = 0.5
-    scheduler_patience: int = 20
+    # 学习率调度器（与informer-prv一致）
+    scheduler_factor: float = 0.5    # 从informer-prv: 0.5
+    scheduler_patience: int = 20     # 从informer-prv: 20
     
     # 梯度裁剪
-    max_grad_norm: float = 1.0
+    use_grad_clip: bool = False  # 是否启用梯度裁剪
+    max_grad_norm: float = 1.0  # 梯度裁剪最大范数
     
     # 训练模式
     train_mode: str = "dual_stream"    # 训练模式
@@ -111,7 +118,7 @@ class TrainingConfig:
     seed: int = 42
     
     # 早停配置
-    early_stopping: bool = True
+    early_stopping: bool = False
     early_stopping_patience: int = 50
 
 
