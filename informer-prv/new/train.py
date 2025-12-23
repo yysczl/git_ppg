@@ -86,8 +86,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_mae = 0
         val_rmse = 0
         
+        val_batch_count = 0
         with torch.no_grad():
-            for data, target in val_loader:
+            for batch_idx, (data, target) in enumerate(val_loader):
                 # 将数据移至设备
                 data, target = data.to(device), target.to(device)
                 
@@ -115,7 +116,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 mae = torch.mean(torch.abs(diff))
                 rmse = torch.sqrt(torch.mean(diff ** 2))
                 
-                # 添加调试信息，检查MAE和RMSE计算
+                # 添加调试信息，检查MAE和RMSE计算（仅第一轮第一批次）
                 if epoch == 0 and batch_idx == 0:
                     print(f"调试信息 - 第{epoch+1}轮, 第{batch_idx+1}批次:")
                     print(f"  输出值范围: {output.squeeze().min().item():.4f} ~ {output.squeeze().max().item():.4f}")
@@ -125,11 +126,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 
                 val_mae += mae.item()
                 val_rmse += rmse.item()
+                val_batch_count += 1
             
-            # 计算平均损失
-            val_loss /= len(val_loader)
-            val_mae /= len(val_loader)
-            val_rmse /= len(val_loader)
+        # 计算平均损失
+        val_loss /= val_batch_count
+        val_mae /= val_batch_count
+        val_rmse /= val_batch_count
         
         # 保存最佳模型
         if val_loss < best_val_loss:
