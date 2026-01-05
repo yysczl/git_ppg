@@ -52,7 +52,9 @@ class Trainer:
         
         # 损失函数
         if self.task_type == 'classification':
-            self.criterion = nn.CrossEntropyLoss()
+            # self.criterion = nn.CrossEntropyLoss()
+            # self.criterion = nn.HuberLoss(delta=1.0)
+            self.criterion = nn.SmoothL1Loss(beta=1.0)
         else:  # regression or multi_task
             self.criterion = nn.MSELoss()
         

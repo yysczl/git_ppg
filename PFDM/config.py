@@ -51,10 +51,10 @@ class BaselineModelConfig:
     
     # 通用参数（与informer-prv一致）
     input_dim: int = 1
-    hidden_dim: int = 128  # 与informer-prv的d_model一致
-    num_layers: int = 2    # 与informer-prv的enc_layers一致
+    hidden_dim: int = 64  # 128
+    num_layers: int = 2
     num_classes: int = 5
-    dropout: float = 0.1
+    dropout: float = 0.3   # 0.1
     
     # TCN专用参数
     kernel_size: int = 3
@@ -92,16 +92,16 @@ class TrainingConfig:
     """
     # 基础训练参数（与informer-prv一致）
     num_epochs: int = 300       # 从informer-prv: 300
-    batch_size: int = 4         # 从informer-prv: 8
-    learning_rate: float = 0.0005  # 从informer-prv: 0.0005
-    weight_decay: float = 1e-4  # 从informer-prv: 1e-4
+    batch_size: int = 16         # 从informer-prv: 8
+    learning_rate: float = 0.001  # 从informer-prv: 0.0005
+    weight_decay: float = 1e-3  # 从informer-prv: 1e-4
     
     # K折交叉验证
     k_folds: int = 5            # 从informer-prv: 5
     
     # 学习率调度器（与informer-prv一致）
     scheduler_factor: float = 0.5    # 从informer-prv: 0.5
-    scheduler_patience: int = 20     # 从informer-prv: 20
+    scheduler_patience: int = 30     # 从informer-prv: 20
     
     # 梯度裁剪
     use_grad_clip: bool = False  # 是否启用梯度裁剪
