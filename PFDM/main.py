@@ -287,8 +287,8 @@ def load_data_new(config: ExperimentConfig, selected_emotions: List[str] = None)
             print(f"错误: PPG数据目录不存在: {ppg_dir}")
             return None
         
-        ppg_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
-            ppg_dir, "PPG", selected_emotions
+        ppg_features, stress_labels, emotion_labels, stress_scaler = load_emotion_data_from_folder(
+            ppg_dir, "PPG", selected_emotions, normalize_stress=True
         )
         
         from sklearn.preprocessing import StandardScaler
@@ -300,6 +300,7 @@ def load_data_new(config: ExperimentConfig, selected_emotions: List[str] = None)
         result['y_emotion'] = emotion_labels
         result['X_prv'] = None
         result['scaler'] = scaler
+        result['stress_scaler'] = stress_scaler  # 保存压力标签scaler用于反归一化
         
     elif train_mode in ['prv_only', 'prv_regression', 'prv_classification',
                          'baseline_prv_regression', 'baseline_prv_classification']:
@@ -308,8 +309,8 @@ def load_data_new(config: ExperimentConfig, selected_emotions: List[str] = None)
             print(f"错误: PRV数据目录不存在: {prv_dir}")
             return None
         
-        prv_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
-            prv_dir, "PRV", selected_emotions
+        prv_features, stress_labels, emotion_labels, stress_scaler = load_emotion_data_from_folder(
+            prv_dir, "PRV", selected_emotions, normalize_stress=True
         )
         
         from sklearn.preprocessing import StandardScaler
@@ -321,16 +322,18 @@ def load_data_new(config: ExperimentConfig, selected_emotions: List[str] = None)
         result['y_emotion'] = emotion_labels
         result['X_prv'] = None
         result['scaler'] = scaler
+        result['stress_scaler'] = stress_scaler  # 保存压力标签scaler用于反归一化
         
     else:
         # 加载双流数据 (dual_stream / multi_task)
-        data = load_all_emotion_data(ppg_dir, prv_dir, selected_emotions, normalize=True)
+        data = load_all_emotion_data(ppg_dir, prv_dir, selected_emotions, normalize=True, normalize_stress=True)
         
         result['X_data'] = data['ppg_features']
         result['X_prv'] = data.get('prv_features', None)
         result['y_stress'] = data['stress_labels']
         result['y_emotion'] = data['emotion_labels']
         result['scaler'] = data.get('ppg_scaler', None)
+        result['stress_scaler'] = data.get('stress_scaler', None)  # 保存压力标签scaler用于反归一化
     
     # 验证分类任务必须使用全部5种情绪
     if task_type in ['classification', 'multi_task']:
@@ -488,6 +491,7 @@ def train_mode_func(args, config: ExperimentConfig):
     X_prv = data['X_prv']
     y_stress = data['y_stress']
     y_emotion = data['y_emotion']
+    stress_scaler = data.get('stress_scaler', None)  # 获取压力标签scaler用于反归一化
     
     # 获取模型配置
     model_class, model_params, model_name = get_model_and_params(config, X_prv is not None)
@@ -543,7 +547,8 @@ def train_mode_func(args, config: ExperimentConfig):
         config=config,
         logger=logger,
         use_emotion=use_emotion,
-        stratify_by_emotion=(task_type == 'classification')
+        stratify_by_emotion=(task_type == 'classification'),
+        stress_scaler=stress_scaler  # 传递stress_scaler用于反归一化显示真实值
     )
     
     # 计算平均历史
@@ -664,29 +669,50 @@ def train_mode_func(args, config: ExperimentConfig):
         # 计算测试集评估指标
         predictions = np.array(all_predictions)
         targets = np.array(all_targets)
-        test_metrics = calculate_metrics(predictions, targets)
         
-        print(f"\n测试集评估结果:")
-        print(f"  MAE: {test_metrics['mae']:.4f}")
-        print(f"  RMSE: {test_metrics['rmse']:.4f}")
-        print(f"  R²: {test_metrics['r2']:.4f}")
-        print(f"  相关系数: {test_metrics['correlation']:.4f}")
+        # 反归一化压力标签，显示真实的评估指标
+        if stress_scaler is not None:
+            predictions_real = stress_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
+            targets_real = stress_scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
+            print(f"\n测试集评估结果（反归一化后的真实压力值）:")
+            real_metrics = calculate_metrics(predictions_real, targets_real)
+            print(f"  MAE: {real_metrics['mae']:.4f}")
+            print(f"  RMSE: {real_metrics['rmse']:.4f}")
+            print(f"  R²: {real_metrics['r2']:.4f}")
+            print(f"  相关系数: {real_metrics['correlation']:.4f}")
+            print(f"  压力标签范围: [{targets_real.min():.2f}, {targets_real.max():.2f}]")
+        else:
+            predictions_real = predictions
+            targets_real = targets
+            real_metrics = calculate_metrics(predictions, targets)
+            print(f"\n测试集评估结果:")
+            print(f"  MAE: {real_metrics['mae']:.4f}")
+            print(f"  RMSE: {real_metrics['rmse']:.4f}")
+            print(f"  R²: {real_metrics['r2']:.4f}")
+            print(f"  相关系数: {real_metrics['correlation']:.4f}")
         
-        # 绘制预测散点图
+        # 同时显示归一化后的指标（用于对比）
+        norm_metrics = calculate_metrics(predictions, targets)
+        print(f"\n测试集评估结果（归一化后 [0,1] 范围）:")
+        print(f"  MAE: {norm_metrics['mae']:.4f}")
+        print(f"  RMSE: {norm_metrics['rmse']:.4f}")
+        print(f"  R²: {norm_metrics['r2']:.4f}")
+        
+        # 绘制预测散点图（使用真实压力值）
         save_path = plot_predictions(
-            predictions.tolist(),
-            targets.tolist(),
+            predictions_real.tolist(),
+            targets_real.tolist(),
             model_name,
             config.log.result_dir,
             show=True
         )
         print(f"\n预测散点图已保存到: {save_path}")
         
-        # 记录测试结果到日志
+        # 记录测试结果到日志（使用真实压力值指标）
         logger.log_test_result(
-            test_loss=test_metrics['mse'],
-            test_mae=test_metrics['mae'],
-            test_rmse=test_metrics['rmse']
+            test_loss=real_metrics['mse'],
+            test_mae=real_metrics['mae'],
+            test_rmse=real_metrics['rmse']
         )
 
 
@@ -714,6 +740,7 @@ def eval_mode_func(args, config: ExperimentConfig):
     X_prv = data['X_prv']
     y_stress = data['y_stress']
     y_emotion = data['y_emotion']
+    stress_scaler = data.get('stress_scaler', None)  # 获取压力标签scaler用于反归一化
     
     # 获取模型配置
     model_class, model_params, model_name = get_model_and_params(config, X_prv is not None)

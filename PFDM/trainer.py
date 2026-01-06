@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from utils import Logger, set_seed, calculate_classification_metrics
+from sklearn.preprocessing import MinMaxScaler
 
 
 class Trainer:
@@ -31,18 +32,20 @@ class Trainer:
     """
     
     def __init__(self, model: nn.Module, config: Any, logger: Logger = None,
-                 device: str = 'cpu'):
+                 device: str = 'cpu', stress_scaler: MinMaxScaler = None):
         """
         Args:
             model: 模型实例
             config: 配置对象
             logger: 日志记录器
             device: 设备
+            stress_scaler: 压力标签的MinMaxScaler，用于反归一化显示真实值
         """
         self.model = model
         self.config = config
         self.logger = logger
         self.device = torch.device(device)
+        self.stress_scaler = stress_scaler  # 保存scaler用于反归一化
         
         # 获取任务类型
         self.task_type = getattr(config.training, 'task_type', 'regression')
@@ -115,6 +118,7 @@ class Trainer:
         """
         self.model.train()
         total_loss = 0
+        total_loss_real = 0  # 真实值的损失
         total_mae = 0
         total_rmse = 0
         total_correct = 0
@@ -157,6 +161,7 @@ class Trainer:
             )
             total_mae += metrics.get('mae', 0)
             total_rmse += metrics.get('rmse', 0)
+            total_loss_real += metrics.get('loss_real', 0)  # 累加真实值损失
             total_correct += metrics.get('correct', 0)
             total_samples += metrics.get('samples', 0)
             
@@ -166,8 +171,14 @@ class Trainer:
             
             batch_count += 1
         
+        # 对于回归任务，使用真实值的损失
+        if self.task_type != 'classification' and self.stress_scaler is not None:
+            display_loss = total_loss_real / batch_count
+        else:
+            display_loss = total_loss / batch_count
+        
         result = {
-            'loss': total_loss / batch_count,
+            'loss': display_loss,
             'mae': total_mae / batch_count if self.task_type != 'classification' else 0,
             'rmse': total_rmse / batch_count if self.task_type != 'classification' else 0,
         }
@@ -291,16 +302,24 @@ class Trainer:
     
     def _compute_batch_metrics(self, outputs: dict, stress_target, emotion_target,
                                use_emotion: bool) -> dict:
-        """计算批次指标"""
+        """计算批次指标（使用反归一化后的真实值）"""
         metrics = {}
         
         with torch.no_grad():
             if 'stress_pred' in outputs and stress_target is not None:
-                pred = outputs['stress_pred'].squeeze()
-                target = stress_target.squeeze()
-                diff = torch.abs(pred - target)
-                metrics['mae'] = torch.mean(diff).item()
-                metrics['rmse'] = torch.sqrt(torch.mean(diff ** 2)).item()
+                pred = outputs['stress_pred'].squeeze().cpu().numpy()
+                target = stress_target.squeeze().cpu().numpy()
+                
+                # 反归一化到真实压力值范围
+                if self.stress_scaler is not None:
+                    pred = self.stress_scaler.inverse_transform(pred.reshape(-1, 1)).flatten()
+                    target = self.stress_scaler.inverse_transform(target.reshape(-1, 1)).flatten()
+                
+                diff = np.abs(pred - target)
+                metrics['mae'] = np.mean(diff)
+                metrics['rmse'] = np.sqrt(np.mean(diff ** 2))
+                # 计算真实值的MSE损失
+                metrics['loss_real'] = np.mean((pred - target) ** 2)
             
             if 'emotion_pred' in outputs and emotion_target is not None:
                 pred = outputs['emotion_pred']
@@ -327,6 +346,7 @@ class Trainer:
         """
         self.model.eval()
         total_loss = 0
+        total_loss_real = 0  # 真实值的损失
         total_mae = 0
         total_rmse = 0
         total_correct = 0
@@ -357,6 +377,7 @@ class Trainer:
                 )
                 total_mae += metrics.get('mae', 0)
                 total_rmse += metrics.get('rmse', 0)
+                total_loss_real += metrics.get('loss_real', 0)  # 累加真实值损失
                 total_correct += metrics.get('correct', 0)
                 total_samples += metrics.get('samples', 0)
                 
@@ -366,8 +387,14 @@ class Trainer:
                 
                 batch_count += 1
         
+        # 对于回归任务，使用真实值的损失
+        if self.task_type != 'classification' and self.stress_scaler is not None:
+            display_loss = total_loss_real / batch_count
+        else:
+            display_loss = total_loss / batch_count
+        
         result = {
-            'loss': total_loss / batch_count,
+            'loss': display_loss,
             'mae': total_mae / batch_count if self.task_type != 'classification' else 0,
             'rmse': total_rmse / batch_count if self.task_type != 'classification' else 0,
         }
@@ -510,9 +537,13 @@ def train_single_fold(model_class, model_params: dict,
                       X_val: np.ndarray, X_prv_val: Optional[np.ndarray],
                       y_stress_val: np.ndarray, y_emotion_val: Optional[np.ndarray],
                       config, logger: Logger = None,
-                      use_emotion: bool = False) -> Tuple[dict, dict, dict]:
+                      use_emotion: bool = False,
+                      stress_scaler: MinMaxScaler = None) -> Tuple[dict, dict, dict]:
     """
     训练单折模型
+    
+    Args:
+        stress_scaler: 压力标签的MinMaxScaler，用于反归一化显示真实值
     
     Returns:
         history, best_model_state, fold_result
@@ -560,8 +591,8 @@ def train_single_fold(model_class, model_params: dict,
     # 创建模型
     model = model_class(**model_params)
     
-    # 创建训练器
-    trainer = Trainer(model, config, logger, device)
+    # 创建训练器（传递stress_scaler用于反归一化）
+    trainer = Trainer(model, config, logger, device, stress_scaler=stress_scaler)
     
     # 训练
     history = trainer.train(
@@ -590,7 +621,8 @@ def train_kfold(model_class, model_params: dict,
                 y_stress: np.ndarray, y_emotion: Optional[np.ndarray],
                 config, logger: Logger = None,
                 use_emotion: bool = False,
-                stratify_by_emotion: bool = True) -> Tuple[List[dict], List[dict], List[dict]]:
+                stratify_by_emotion: bool = True,
+                stress_scaler: MinMaxScaler = None) -> Tuple[List[dict], List[dict], List[dict]]:
     """
     K折交叉验证训练
     
@@ -605,6 +637,7 @@ def train_kfold(model_class, model_params: dict,
         logger: 日志记录器
         use_emotion: 是否使用情绪任务
         stratify_by_emotion: 是否按情绪分层抽样
+        stress_scaler: 压力标签的MinMaxScaler，用于反归一化显示真实值
     
     Returns:
         all_histories, best_model_states, fold_results
@@ -653,12 +686,12 @@ def train_kfold(model_class, model_params: dict,
         else:
             y_emotion_train, y_emotion_val = None, None
         
-        # 训练单折
+        # 训练单折（传递stress_scaler）
         history, best_state, result = train_single_fold(
             model_class, model_params,
             X_train, X_prv_train, y_stress_train, y_emotion_train,
             X_val, X_prv_val, y_stress_val, y_emotion_val,
-            config, logger, use_emotion
+            config, logger, use_emotion, stress_scaler=stress_scaler
         )
         
         result['fold'] = fold_num

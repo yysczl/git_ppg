@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
@@ -147,14 +147,24 @@ class Logger:
             save_path = os.path.join(self.log_dir, f"{self.experiment_name}_{self.timestamp}_history.json")
         
         # 转换numpy数组为列表
-        history_to_save = {}
-        for key, value in self.history.items():
-            if isinstance(value, np.ndarray):
-                history_to_save[key] = value.tolist()
-            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], np.ndarray):
-                history_to_save[key] = [v.tolist() if isinstance(v, np.ndarray) else v for v in value]
+        def convert_to_serializable(obj):
+            """递归转换numpy类型为Python原生类型"""
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return [convert_to_serializable(item) for item in obj]
             else:
-                history_to_save[key] = value
+                return obj
+        
+        history_to_save = convert_to_serializable(self.history)
         
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(history_to_save, f, indent=4, ensure_ascii=False)
@@ -217,8 +227,10 @@ EMOTION_NAMES = ["Anxiety", "Happy", "Peace", "Sad", "Stress"]
 
 def load_emotion_data_from_folder(data_dir: str, signal_type: str = "PPG",
                                    selected_emotions: List[str] = None,
-                                   emotion_label_map: Dict[str, int] = None
-                                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                   emotion_label_map: Dict[str, int] = None,
+                                   normalize_stress: bool = False,
+                                   stress_scaler: MinMaxScaler = None
+                                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[MinMaxScaler]]:
     """
     从文件夹加载情绪数据
     
@@ -232,11 +244,14 @@ def load_emotion_data_from_folder(data_dir: str, signal_type: str = "PPG",
         signal_type: 信号类型 ("PPG" 或 "PRV")
         selected_emotions: 选择的情绪类别列表，None表示全部
         emotion_label_map: 情绪标签映射字典
+        normalize_stress: 是否对压力标签进行归一化（MinMaxScaler归一化到[0,1]）
+        stress_scaler: 已有的压力标签scaler（用于测试集使用训练集的scaler）
     
     Returns:
         features: 特征数据 [n_samples, seq_len]
-        stress_labels: 压力标签 [n_samples]
+        stress_labels: 压力标签 [n_samples]（如果normalize_stress=True则已归一化）
         emotion_labels: 情绪标签 [n_samples]
+        stress_scaler: 压力标签的MinMaxScaler（如果normalize_stress=True）
     """
     if emotion_label_map is None:
         emotion_label_map = EMOTION_LABEL_MAP
@@ -296,18 +311,33 @@ def load_emotion_data_from_folder(data_dir: str, signal_type: str = "PPG",
     stress_labels = np.concatenate(all_stress_labels, axis=0)
     emotion_labels = np.concatenate(all_emotion_labels, axis=0)
     
+    # 压力标签归一化处理
+    returned_scaler = None
+    if normalize_stress:
+        if stress_scaler is not None:
+            # 使用已有的scaler（如测试集使用训练集的scaler）
+            stress_labels = stress_scaler.transform(stress_labels.reshape(-1, 1)).flatten()
+            returned_scaler = stress_scaler
+        else:
+            # 创建新的scaler并进行归一化
+            returned_scaler = MinMaxScaler(feature_range=(0, 1))
+            stress_labels = returned_scaler.fit_transform(stress_labels.reshape(-1, 1)).flatten()
+        print(f"  压力标签已归一化到 [0, 1] 范围")
+    
     print(f"\n{signal_type}数据加载完成:")
     print(f"  特征形状: {features.shape}")
     print(f"  压力标签形状: {stress_labels.shape}")
+    print(f"  压力标签范围: [{stress_labels.min():.4f}, {stress_labels.max():.4f}]")
     print(f"  情绪标签形状: {emotion_labels.shape}")
     print(f"  情绪类别分布: {dict(zip(*np.unique(emotion_labels, return_counts=True)))}")
     
-    return features, stress_labels, emotion_labels
+    return features, stress_labels, emotion_labels, returned_scaler
 
 
 def load_all_emotion_data(ppg_dir: str, prv_dir: str = None,
                           selected_emotions: List[str] = None,
-                          normalize: bool = True
+                          normalize: bool = True,
+                          normalize_stress: bool = True
                           ) -> Dict[str, np.ndarray]:
     """
     加载所有情绪数据（PPG和PRV）
@@ -317,15 +347,16 @@ def load_all_emotion_data(ppg_dir: str, prv_dir: str = None,
         prv_dir: PRV数据目录，None表示不加载PRV
         selected_emotions: 选择的情绪类别
         normalize: 是否标准化特征
+        normalize_stress: 是否归一化压力标签到[0,1]范围
     
     Returns:
-        包含数据的字典
+        包含数据的字典，包括 stress_scaler 用于后续反归一化
     """
     result = {}
     
-    # 加载PPG数据
-    ppg_features, stress_labels, emotion_labels = load_emotion_data_from_folder(
-        ppg_dir, "PPG", selected_emotions
+    # 加载PPG数据（并归一化压力标签）
+    ppg_features, stress_labels, emotion_labels, stress_scaler = load_emotion_data_from_folder(
+        ppg_dir, "PPG", selected_emotions, normalize_stress=normalize_stress
     )
     
     if normalize:
@@ -337,10 +368,15 @@ def load_all_emotion_data(ppg_dir: str, prv_dir: str = None,
     result['stress_labels'] = stress_labels
     result['emotion_labels'] = emotion_labels
     
+    # 保存压力标签的scaler（用于后续反归一化）
+    if stress_scaler is not None:
+        result['stress_scaler'] = stress_scaler
+    
     # 加载PRV数据
     if prv_dir is not None and os.path.exists(prv_dir):
-        prv_features, _, _ = load_emotion_data_from_folder(
-            prv_dir, "PRV", selected_emotions
+        # PRV数据不需要单独归一化压力标签，因为PPG和PRV共用同一个压力标签
+        prv_features, _, _, _ = load_emotion_data_from_folder(
+            prv_dir, "PRV", selected_emotions, normalize_stress=False
         )
         
         if normalize:
