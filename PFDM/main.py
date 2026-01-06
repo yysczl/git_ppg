@@ -145,7 +145,7 @@ from utils import (
     load_emotion_data_from_folder, load_all_emotion_data,
     prepare_data_for_training, split_data_by_emotion,
     plot_training_process, plot_predictions, plot_fold_comparison,
-    count_parameters, save_model, load_model
+    count_parameters, save_model, load_model, calculate_metrics
 )
 
 
@@ -583,8 +583,111 @@ def train_mode_func(args, config: ExperimentConfig):
     for key, value in fold_results[best_fold_idx].items():
         if isinstance(value, float):
             print(f"  {key}: {value:.4f}")
-    print(f"\n模型已保存到: {model_save_path}")
     print(f"日志已保存到: {logger.log_file}")
+    
+    # ===== 测试阶段：在测试集上评估并可视化 =====
+    if task_type != 'classification':
+        print("\n===== 测试集评估与可视化 =====")
+        
+        # 使用 train_test_split 直接划分测试集
+        from sklearn.model_selection import train_test_split
+        _, X_test, _, y_stress_test = train_test_split(
+            X_data, y_stress,
+            test_size=config.data.test_size,
+            random_state=42,
+            stratify=y_emotion
+        )
+        
+        # 准备PRV测试数据（如果有）
+        X_prv_test = None
+        if X_prv is not None:
+            _, X_prv_test = train_test_split(
+                X_prv,
+                test_size=config.data.test_size,
+                random_state=42,
+                stratify=y_emotion
+            )
+        
+        # 创建测试数据加载器
+        test_tensors = [torch.tensor(X_test, dtype=torch.float32)]
+        if X_prv_test is not None and train_mode in ['dual_stream', 'multi_task']:
+            test_tensors.append(torch.tensor(X_prv_test, dtype=torch.float32))
+        test_tensors.append(torch.tensor(y_stress_test, dtype=torch.float32).reshape(-1, 1))
+        
+        test_dataset = TensorDataset(*test_tensors)
+        test_loader = DataLoader(test_dataset, batch_size=config.training.batch_size, shuffle=False)
+        
+        # 使用最佳模型进行预测
+        best_model.eval()
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch_data in test_loader:
+                if len(batch_data) == 3:  # PPG + PRV + stress
+                    ppg_data = batch_data[0].to(device)
+                    prv_data = batch_data[1].to(device)
+                    stress_target = batch_data[2]
+                    
+                    # 确保输入维度正确
+                    if ppg_data.dim() == 2:
+                        ppg_data = ppg_data.unsqueeze(-1)
+                    if prv_data.dim() == 2:
+                        prv_data = prv_data.unsqueeze(-1)
+                    
+                    # 前向传播
+                    output = best_model(ppg_data, prv_data)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                else:  # PPG/PRV + stress
+                    input_data = batch_data[0].to(device)
+                    stress_target = batch_data[1]
+                    
+                    if input_data.dim() == 2:
+                        input_data = input_data.unsqueeze(-1)
+                    
+                    output = best_model(input_data)
+                    if isinstance(output, tuple):
+                        output = output[0]
+                
+                # 收集预测和目标
+                pred = output.squeeze().cpu().numpy()
+                target = stress_target.squeeze().numpy()
+                
+                if np.ndim(pred) == 0:
+                    all_predictions.append(pred.item())
+                    all_targets.append(target.item())
+                else:
+                    all_predictions.extend(pred.tolist())
+                    all_targets.extend(target.tolist())
+        
+        # 计算测试集评估指标
+        predictions = np.array(all_predictions)
+        targets = np.array(all_targets)
+        test_metrics = calculate_metrics(predictions, targets)
+        
+        print(f"\n测试集评估结果:")
+        print(f"  MAE: {test_metrics['mae']:.4f}")
+        print(f"  RMSE: {test_metrics['rmse']:.4f}")
+        print(f"  R²: {test_metrics['r2']:.4f}")
+        print(f"  相关系数: {test_metrics['correlation']:.4f}")
+        
+        # 绘制预测散点图
+        save_path = plot_predictions(
+            predictions.tolist(),
+            targets.tolist(),
+            model_name,
+            config.log.result_dir,
+            show=True
+        )
+        print(f"\n预测散点图已保存到: {save_path}")
+        
+        # 记录测试结果到日志
+        logger.log_test_result(
+            test_loss=test_metrics['mse'],
+            test_mae=test_metrics['mae'],
+            test_rmse=test_metrics['rmse']
+        )
 
 
 def eval_mode_func(args, config: ExperimentConfig):
@@ -680,12 +783,26 @@ def eval_mode_func(args, config: ExperimentConfig):
     else:
         test_metrics = evaluator.evaluate_regression(test_loader)
     
-    # 绘制结果
-    if config.log.save_plots and 'predictions' in test_metrics:
-        plot_predictions(
-            test_metrics['predictions'], test_metrics['targets'],
-            model_name + "_eval", config.log.result_dir, show=True
+    # 绘制预测散点图（回归任务）
+    if task_type != 'classification' and 'predictions' in test_metrics:
+        print("\n===== 预测结果可视化 =====")
+        
+        # 打印详细评估指标
+        print(f"测试集评估结果:")
+        print(f"  MAE: {test_metrics['mae']:.4f}")
+        print(f"  RMSE: {test_metrics['rmse']:.4f}")
+        print(f"  R²: {test_metrics['r2']:.4f}")
+        print(f"  相关系数: {test_metrics['correlation']:.4f}")
+        
+        # 绘制散点图
+        save_path = plot_predictions(
+            test_metrics['predictions'],
+            test_metrics['targets'],
+            model_name + "_eval",
+            config.log.result_dir,
+            show=True
         )
+        print(f"\n预测散点图已保存到: {save_path}")
 
 
 def ablation_mode_func(args, config: ExperimentConfig):
