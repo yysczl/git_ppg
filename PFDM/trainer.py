@@ -55,11 +55,11 @@ class Trainer:
         
         # 损失函数
         if self.task_type == 'classification':
-            # self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.CrossEntropyLoss()
+        else:  # regression or multi_task
+            # self.criterion = nn.MSELoss()
             # self.criterion = nn.HuberLoss(delta=1.0)
             self.criterion = nn.SmoothL1Loss(beta=1.0)
-        else:  # regression or multi_task
-            self.criterion = nn.MSELoss()
         
         # 优化器
         self.optimizer = optim.AdamW(
@@ -119,8 +119,9 @@ class Trainer:
         self.model.train()
         total_loss = 0
         total_loss_real = 0  # 真实值的损失
-        total_mae = 0
-        total_rmse = 0
+        total_abs_error = 0  # 累计绝对误差（用于MAE）
+        total_sq_error = 0   # 累计平方误差（用于RMSE）
+        total_regression_samples = 0  # 回归样本总数
         total_correct = 0
         total_samples = 0
         all_preds = []
@@ -159,9 +160,11 @@ class Trainer:
             metrics = self._compute_batch_metrics(
                 outputs, stress_target, emotion_target, use_emotion
             )
-            total_mae += metrics.get('mae', 0)
-            total_rmse += metrics.get('rmse', 0)
-            total_loss_real += metrics.get('loss_real', 0)  # 累加真实值损失
+            # 累加误差总和而非批次平均
+            total_abs_error += metrics.get('abs_error_sum', 0)
+            total_sq_error += metrics.get('sq_error_sum', 0)
+            total_regression_samples += metrics.get('regression_samples', 0)
+            total_loss_real += metrics.get('loss_real_sum', 0)  # 累加真实值损失
             total_correct += metrics.get('correct', 0)
             total_samples += metrics.get('samples', 0)
             
@@ -171,16 +174,17 @@ class Trainer:
             
             batch_count += 1
         
-        # 对于回归任务，使用真实值的损失
-        if self.task_type != 'classification' and self.stress_scaler is not None:
-            display_loss = total_loss_real / batch_count
+        # 计算显示用的损失（真实值）
+        if self.task_type != 'classification' and self.stress_scaler is not None and total_regression_samples > 0:
+            display_loss = total_loss_real / total_regression_samples
         else:
-            display_loss = total_loss / batch_count
+            display_loss = total_loss / batch_count if batch_count > 0 else 0
         
         result = {
-            'loss': display_loss,
-            'mae': total_mae / batch_count if self.task_type != 'classification' else 0,
-            'rmse': total_rmse / batch_count if self.task_type != 'classification' else 0,
+            'loss': total_loss / batch_count if batch_count > 0 else 0,  # 归一化损失用于比较/调度
+            'loss_display': display_loss,  # 真实值损失用于日志显示
+            'mae': total_abs_error / total_regression_samples if total_regression_samples > 0 else 0,
+            'rmse': np.sqrt(total_sq_error / total_regression_samples) if total_regression_samples > 0 else 0,
         }
         
         if total_samples > 0:
@@ -302,7 +306,7 @@ class Trainer:
     
     def _compute_batch_metrics(self, outputs: dict, stress_target, emotion_target,
                                use_emotion: bool) -> dict:
-        """计算批次指标（使用反归一化后的真实值）"""
+        """计算批次指标（使用反归一化后的真实值，返回误差总和用于样本级累加）"""
         metrics = {}
         
         with torch.no_grad():
@@ -310,16 +314,22 @@ class Trainer:
                 pred = outputs['stress_pred'].squeeze().cpu().numpy()
                 target = stress_target.squeeze().cpu().numpy()
                 
+                # 确保是一维数组
+                pred = np.atleast_1d(pred)
+                target = np.atleast_1d(target)
+                
                 # 反归一化到真实压力值范围
                 if self.stress_scaler is not None:
                     pred = self.stress_scaler.inverse_transform(pred.reshape(-1, 1)).flatten()
                     target = self.stress_scaler.inverse_transform(target.reshape(-1, 1)).flatten()
                 
+                # 返回误差总和而非平均值，确保每个样本权重一致
                 diff = np.abs(pred - target)
-                metrics['mae'] = np.mean(diff)
-                metrics['rmse'] = np.sqrt(np.mean(diff ** 2))
-                # 计算真实值的MSE损失
-                metrics['loss_real'] = np.mean((pred - target) ** 2)
+                n_samples = len(pred)
+                metrics['abs_error_sum'] = np.sum(diff)  # 绝对误差总和
+                metrics['sq_error_sum'] = np.sum(diff ** 2)  # 平方误差总和
+                metrics['loss_real_sum'] = np.sum((pred - target) ** 2)  # 真实值MSE总和
+                metrics['regression_samples'] = n_samples  # 回归样本数
             
             if 'emotion_pred' in outputs and emotion_target is not None:
                 pred = outputs['emotion_pred']
@@ -347,8 +357,9 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         total_loss_real = 0  # 真实值的损失
-        total_mae = 0
-        total_rmse = 0
+        total_abs_error = 0  # 累计绝对误差（用于MAE）
+        total_sq_error = 0   # 累计平方误差（用于RMSE）
+        total_regression_samples = 0  # 回归样本总数
         total_correct = 0
         total_samples = 0
         all_preds = []
@@ -375,9 +386,11 @@ class Trainer:
                 metrics = self._compute_batch_metrics(
                     outputs, stress_target, emotion_target, use_emotion
                 )
-                total_mae += metrics.get('mae', 0)
-                total_rmse += metrics.get('rmse', 0)
-                total_loss_real += metrics.get('loss_real', 0)  # 累加真实值损失
+                # 累加误差总和而非批次平均
+                total_abs_error += metrics.get('abs_error_sum', 0)
+                total_sq_error += metrics.get('sq_error_sum', 0)
+                total_regression_samples += metrics.get('regression_samples', 0)
+                total_loss_real += metrics.get('loss_real_sum', 0)  # 累加真实值损失
                 total_correct += metrics.get('correct', 0)
                 total_samples += metrics.get('samples', 0)
                 
@@ -387,16 +400,17 @@ class Trainer:
                 
                 batch_count += 1
         
-        # 对于回归任务，使用真实值的损失
-        if self.task_type != 'classification' and self.stress_scaler is not None:
-            display_loss = total_loss_real / batch_count
+        # 计算显示用的损失（真实值）
+        if self.task_type != 'classification' and self.stress_scaler is not None and total_regression_samples > 0:
+            display_loss = total_loss_real / total_regression_samples
         else:
-            display_loss = total_loss / batch_count
+            display_loss = total_loss / batch_count if batch_count > 0 else 0
         
         result = {
-            'loss': display_loss,
-            'mae': total_mae / batch_count if self.task_type != 'classification' else 0,
-            'rmse': total_rmse / batch_count if self.task_type != 'classification' else 0,
+            'loss': total_loss / batch_count if batch_count > 0 else 0,  # 归一化损失用于比较/调度
+            'loss_display': display_loss,  # 真实值损失用于日志显示
+            'mae': total_abs_error / total_regression_samples if total_regression_samples > 0 else 0,
+            'rmse': np.sqrt(total_sq_error / total_regression_samples) if total_regression_samples > 0 else 0,
         }
         
         if total_samples > 0:
@@ -446,6 +460,9 @@ class Trainer:
             # 保存最佳模型
             if val_metrics['loss'] < self.best_val_loss:
                 self.best_val_loss = val_metrics['loss']
+                # 先释放旧的状态
+                if self.best_model_state is not None:
+                    del self.best_model_state
                 self.best_model_state = {
                     k: v.cpu().clone() for k, v in self.model.state_dict().items()
                 }
@@ -453,9 +470,9 @@ class Trainer:
             else:
                 self.early_stop_counter += 1
             
-            # 记录历史
-            self.history['train_losses'].append(train_metrics['loss'])
-            self.history['val_losses'].append(val_metrics['loss'])
+            # 记录历史（使用真实值用于显示）
+            self.history['train_losses'].append(train_metrics.get('loss_display', train_metrics['loss']))
+            self.history['val_losses'].append(val_metrics.get('loss_display', val_metrics['loss']))
             self.history['train_maes'].append(train_metrics.get('mae', 0))
             self.history['val_maes'].append(val_metrics.get('mae', 0))
             self.history['train_rmses'].append(train_metrics.get('rmse', 0))
@@ -483,17 +500,20 @@ class Trainer:
         return self.history
     
     def _log_epoch_metrics(self, epoch: int, train_metrics: dict, val_metrics: dict, lr: float):
-        """记录epoch指标到日志"""
+        """记录epoch指标到日志（使用真实值）"""
         if self.task_type == 'classification':
-            msg = f"Epoch {epoch}: Train Loss={train_metrics['loss']:.4f}, "
-            msg += f"Val Loss={val_metrics['loss']:.4f}, "
+            msg = f"Epoch {epoch}: Train Loss={train_metrics.get('loss_display', train_metrics['loss']):.4f}, "
+            msg += f"Val Loss={val_metrics.get('loss_display', val_metrics['loss']):.4f}, "
             msg += f"Train Acc={train_metrics.get('accuracy', 0):.4f}, "
             msg += f"Val Acc={val_metrics.get('accuracy', 0):.4f}, "
             msg += f"Train F1={train_metrics.get('f1', 0):.4f}, "
             msg += f"Val F1={val_metrics.get('f1', 0):.4f}, LR={lr:.6f}"
         else:
+            # 使用 loss_display 显示真实值损失
+            train_loss_display = train_metrics.get('loss_display', train_metrics['loss'])
+            val_loss_display = val_metrics.get('loss_display', val_metrics['loss'])
             self.logger.log_epoch(
-                epoch, train_metrics['loss'], val_metrics['loss'],
+                epoch, train_loss_display, val_loss_display,
                 train_metrics.get('mae', 0), val_metrics.get('mae', 0),
                 train_metrics.get('rmse', 0), val_metrics.get('rmse', 0), lr
             )
@@ -502,16 +522,20 @@ class Trainer:
     
     def _print_epoch_metrics(self, epoch: int, total_epochs: int, 
                              train_metrics: dict, val_metrics: dict):
-        """打印epoch指标"""
+        """打印epoch指标（使用真实值）"""
         current_lr = self.optimizer.param_groups[0]['lr']
         print(f'Epoch: {epoch}/{total_epochs}')
         
+        # 使用 loss_display 显示真实值损失
+        train_loss = train_metrics.get('loss_display', train_metrics['loss'])
+        val_loss = val_metrics.get('loss_display', val_metrics['loss'])
+        
         if self.task_type == 'classification':
-            print(f'  Train Loss: {train_metrics["loss"]:.4f}, Acc: {train_metrics.get("accuracy", 0):.4f}')
-            print(f'  Val Loss: {val_metrics["loss"]:.4f}, Acc: {val_metrics.get("accuracy", 0):.4f}')
+            print(f'  Train Loss: {train_loss:.4f}, Acc: {train_metrics.get("accuracy", 0):.4f}')
+            print(f'  Val Loss: {val_loss:.4f}, Acc: {val_metrics.get("accuracy", 0):.4f}')
         else:
-            print(f'  Train Loss: {train_metrics["loss"]:.4f}, MAE: {train_metrics.get("mae", 0):.4f}, RMSE: {train_metrics.get("rmse", 0):.4f}')
-            print(f'  Val Loss: {val_metrics["loss"]:.4f}, MAE: {val_metrics.get("mae", 0):.4f}, RMSE: {val_metrics.get("rmse", 0):.4f}')
+            print(f'  Train Loss: {train_loss:.4f}, MAE: {train_metrics.get("mae", 0):.4f}, RMSE: {train_metrics.get("rmse", 0):.4f}')
+            print(f'  Val Loss: {val_loss:.4f}, MAE: {val_metrics.get("mae", 0):.4f}, RMSE: {val_metrics.get("rmse", 0):.4f}')
         print(f'  Learning Rate: {current_lr:.6f}')
     
     def load_best_model(self):
@@ -606,7 +630,8 @@ def train_single_fold(model_class, model_params: dict,
     val_metrics = trainer.validate_epoch(val_loader, use_emotion or task_type == 'multi_task')
     
     fold_result = {
-        'val_loss': val_metrics['loss'],
+        'val_loss': val_metrics['loss'],  # 归一化损失，用于模型选择比较
+        'val_loss_display': val_metrics.get('loss_display', val_metrics['loss']),  # 真实值损失，用于日志显示
         'val_mae': val_metrics.get('mae', 0),
         'val_rmse': val_metrics.get('rmse', 0),
         'val_accuracy': val_metrics.get('accuracy', 0),
@@ -700,27 +725,28 @@ def train_kfold(model_class, model_params: dict,
         best_model_states.append(best_state)
         fold_results.append(result)
         
-        # 记录折结果
+        # 记录折结果（使用真实值损失用于日志显示）
+        val_loss_display = result.get('val_loss_display', result['val_loss'])
         if logger:
             if task_type == 'classification':
-                logger.info(f"第 {fold_num} 折结果 - Val Loss: {result['val_loss']:.4f}, "
+                logger.info(f"第 {fold_num} 折结果 - Val Loss: {val_loss_display:.4f}, "
                            f"Acc: {result.get('val_accuracy', 0):.4f}, F1: {result.get('val_f1', 0):.4f}")
             else:
-                logger.log_fold_result(fold_num, result['val_loss'], result['val_mae'], result['val_rmse'])
+                logger.log_fold_result(fold_num, val_loss_display, result['val_mae'], result['val_rmse'])
         else:
             if task_type == 'classification':
-                print(f"第 {fold_num} 折结果 - Val Loss: {result['val_loss']:.4f}, "
+                print(f"第 {fold_num} 折结果 - Val Loss: {val_loss_display:.4f}, "
                       f"Acc: {result.get('val_accuracy', 0):.4f}, F1: {result.get('val_f1', 0):.4f}")
             else:
-                print(f"第 {fold_num} 折结果 - Val Loss: {result['val_loss']:.4f}, "
+                print(f"第 {fold_num} 折结果 - Val Loss: {val_loss_display:.4f}, "
                       f"MAE: {result['val_mae']:.4f}, RMSE: {result['val_rmse']:.4f}")
     
-    # 计算平均结果
-    avg_val_loss = np.mean([r['val_loss'] for r in fold_results])
+    # 计算平均结果（使用真实值损失用于日志显示）
+    avg_val_loss_display = np.mean([r.get('val_loss_display', r['val_loss']) for r in fold_results])
     
     if logger:
         logger.info(f"\n===== K折交叉验证结果 =====")
-        logger.info(f"平均验证损失: {avg_val_loss:.4f}")
+        logger.info(f"平均验证损失: {avg_val_loss_display:.4f}")
         if task_type == 'classification':
             avg_acc = np.mean([r.get('val_accuracy', 0) for r in fold_results])
             avg_f1 = np.mean([r.get('val_f1', 0) for r in fold_results])
@@ -733,7 +759,7 @@ def train_kfold(model_class, model_params: dict,
             logger.info(f"平均验证RMSE: {avg_val_rmse:.4f}")
     else:
         print(f"\n===== K折交叉验证结果 =====")
-        print(f"平均验证损失: {avg_val_loss:.4f}")
+        print(f"平均验证损失: {avg_val_loss_display:.4f}")
         if task_type == 'classification':
             avg_acc = np.mean([r.get('val_accuracy', 0) for r in fold_results])
             avg_f1 = np.mean([r.get('val_f1', 0) for r in fold_results])
