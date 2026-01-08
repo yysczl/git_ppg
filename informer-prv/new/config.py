@@ -90,7 +90,7 @@ class InformerConfig:
 class TrainingConfig:
     """训练配置"""
     # 基础训练参数
-    num_epochs: int = 300
+    num_epochs: int = 100
     batch_size: int = 8
     learning_rate: float = 0.0005
     weight_decay: float = 1e-4
@@ -110,10 +110,10 @@ class TrainingConfig:
 class DataConfig:
     """数据配置"""
     # 数据集根目录
-    data_root: str = "../../dataset/PRV"
+    data_root: str = "../../PFDM/dataset/PRV"
     
     # 数据文件名
-    data_file: str = "StressPRV.csv"
+    data_file: str = "Stress.csv"
     
     # 信号类型
     signal_type: str = "prv"

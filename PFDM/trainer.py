@@ -12,6 +12,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import KFold, StratifiedKFold
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
 
 from utils import Logger, set_seed, calculate_classification_metrics
 from sklearn.preprocessing import MinMaxScaler
@@ -57,30 +58,60 @@ class Trainer:
         if self.task_type == 'classification':
             self.criterion = nn.CrossEntropyLoss()
         else:  # regression or multi_task
-            # self.criterion = nn.MSELoss()
+            # 使用MSELoss替代SmoothL1Loss，更平滑
+            self.criterion = nn.MSELoss()
             # self.criterion = nn.HuberLoss(delta=1.0)
-            self.criterion = nn.SmoothL1Loss(beta=1.0)
+            # self.criterion = nn.SmoothL1Loss(beta=1.0)
         
-        # 优化器
+        # 优化器 - 使用更稳定的参数设置
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay
+            weight_decay=config.training.weight_decay,
+            betas=(0.9, 0.999),  # 使用默认的beta参数
+            eps=1e-8  # 防止除零的小常数
         )
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=config.training.scheduler_factor,
-            patience=config.training.scheduler_patience
-        )
+        # 学习率调度器 - 根据配置选择调度器
+        if hasattr(config.training, 'use_cosine_annealing') and config.training.use_cosine_annealing:
+            self.scheduler = CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=config.training.cosine_annealing_t0,
+                T_mult=config.training.cosine_annealing_tmult,
+                eta_min=config.training.cosine_annealing_eta_min
+            )
+        else:
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=config.training.scheduler_factor,
+                patience=config.training.scheduler_patience
+            )
+        
+        # 记录使用的调度器类型
+        self.use_cosine_scheduler = hasattr(config.training, 'use_cosine_annealing') and config.training.use_cosine_annealing
         
         # 训练状态
         self.best_val_loss = float('inf')
         self.best_model_state = None
         self.current_epoch = 0
         self.early_stop_counter = 0
+        
+        # 指数移动平均用于平滑训练过程
+        self.smoothing_alpha = getattr(config.training, 'smoothing_alpha', 0.9)
+        # 平滑状态变量（用于所有指标）
+        self.running_metrics = {
+            'train_loss': None,
+            'val_loss': None,
+            'train_mae': None,
+            'val_mae': None,
+            'train_rmse': None,
+            'val_rmse': None,
+            'train_acc': None,
+            'val_acc': None,
+            'train_f1': None,
+            'val_f1': None,
+        }
         
         # 训练历史
         self.history = {
@@ -103,6 +134,35 @@ class Trainer:
             self.logger.info(message)
         else:
             print(message)
+    
+    def _apply_ema_smoothing(self, raw_metrics: dict) -> dict:
+        """
+        应用指数移动平均平滑到所有指标
+        
+        Args:
+            raw_metrics: 原始指标字典
+        
+        Returns:
+            平滑后的指标字典
+        """
+        smoothed = {}
+        for key, value in raw_metrics.items():
+            if self.running_metrics[key] is None:
+                # 第一个epoch，直接使用原始值
+                self.running_metrics[key] = value
+            else:
+                # 应用EMA: new_value = alpha * old_value + (1 - alpha) * raw_value
+                self.running_metrics[key] = (
+                    self.smoothing_alpha * self.running_metrics[key] + 
+                    (1 - self.smoothing_alpha) * value
+                )
+            smoothed[key] = self.running_metrics[key]
+        return smoothed
+    
+    def reset_smoothing_state(self):
+        """重置平滑状态（用于新的训练开始时）"""
+        for key in self.running_metrics:
+            self.running_metrics[key] = None
     
     def train_epoch(self, train_loader: DataLoader, use_emotion: bool = False
                     ) -> Dict[str, float]:
@@ -146,11 +206,11 @@ class Trainer:
             # 反向传播
             loss.backward()
             
-            # 梯度裁剪（可选）
+            # 梯度裁剪（强制启用以稳定训练）
             if getattr(self.config.training, 'use_grad_clip', True):
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_norm=self.config.training.max_grad_norm
+                    max_norm=getattr(self.config.training, 'max_grad_norm', 1.0)
                 )
             
             self.optimizer.step()
@@ -454,8 +514,13 @@ class Trainer:
             # 验证
             val_metrics = self.validate_epoch(val_loader, use_emotion)
             
-            # 更新学习率
-            self.scheduler.step(val_metrics['loss'])
+            # 更新学习率 - 根据调度器类型选择更新方式
+            if self.use_cosine_scheduler:
+                # 余弦退火调度器使用epoch作为参数
+                self.scheduler.step(epoch + val_metrics['loss']*1e-6)  # 添加小的扰动避免完全相同的步长
+            else:
+                # ReduceLROnPlateau使用验证损失作为参数
+                self.scheduler.step(val_metrics['loss'])
             
             # 保存最佳模型
             if val_metrics['loss'] < self.best_val_loss:
@@ -470,17 +535,33 @@ class Trainer:
             else:
                 self.early_stop_counter += 1
             
-            # 记录历史（使用真实值用于显示）
-            self.history['train_losses'].append(train_metrics.get('loss_display', train_metrics['loss']))
-            self.history['val_losses'].append(val_metrics.get('loss_display', val_metrics['loss']))
-            self.history['train_maes'].append(train_metrics.get('mae', 0))
-            self.history['val_maes'].append(val_metrics.get('mae', 0))
-            self.history['train_rmses'].append(train_metrics.get('rmse', 0))
-            self.history['val_rmses'].append(val_metrics.get('rmse', 0))
-            self.history['train_accs'].append(train_metrics.get('accuracy', 0))
-            self.history['val_accs'].append(val_metrics.get('accuracy', 0))
-            self.history['train_f1s'].append(train_metrics.get('f1', 0))
-            self.history['val_f1s'].append(val_metrics.get('f1', 0))
+            # 记录历史（使用真实值用于显示）并应用平滑
+            raw_metrics = {
+                'train_loss': train_metrics.get('loss_display', train_metrics['loss']),
+                'val_loss': val_metrics.get('loss_display', val_metrics['loss']),
+                'train_mae': train_metrics.get('mae', 0),
+                'val_mae': val_metrics.get('mae', 0),
+                'train_rmse': train_metrics.get('rmse', 0),
+                'val_rmse': val_metrics.get('rmse', 0),
+                'train_acc': train_metrics.get('accuracy', 0),
+                'val_acc': val_metrics.get('accuracy', 0),
+                'train_f1': train_metrics.get('f1', 0),
+                'val_f1': val_metrics.get('f1', 0),
+            }
+                    
+            # 应用指数移动平均平滑到所有指标
+            smoothed_metrics = self._apply_ema_smoothing(raw_metrics)
+                    
+            self.history['train_losses'].append(smoothed_metrics['train_loss'])
+            self.history['val_losses'].append(smoothed_metrics['val_loss'])
+            self.history['train_maes'].append(smoothed_metrics['train_mae'])
+            self.history['val_maes'].append(smoothed_metrics['val_mae'])
+            self.history['train_rmses'].append(smoothed_metrics['train_rmse'])
+            self.history['val_rmses'].append(smoothed_metrics['val_rmse'])
+            self.history['train_accs'].append(smoothed_metrics['train_acc'])
+            self.history['val_accs'].append(smoothed_metrics['val_acc'])
+            self.history['train_f1s'].append(smoothed_metrics['train_f1'])
+            self.history['val_f1s'].append(smoothed_metrics['val_f1'])
             
             # 日志记录
             if self.logger:

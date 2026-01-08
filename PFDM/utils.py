@@ -679,14 +679,102 @@ def create_data_loaders(X_ppg: np.ndarray, X_prv: Optional[np.ndarray],
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
+# ============ 曲线平滑工具函数 ============
+def smooth_curve(data: List[float], window_size: int = 5, method: str = 'moving_avg') -> List[float]:
+    """
+    平滑曲线数据
+    
+    Args:
+        data: 原始数据列表
+        window_size: 平滑窗口大小（对于 moving_avg 和 savgol 方法）
+        method: 平滑方法
+            - 'moving_avg': 移动平均
+            - 'ema': 指数移动平均
+            - 'savgol': Savitzky-Golay滤波器
+    
+    Returns:
+        平滑后的数据列表
+    """
+    if len(data) < 3:
+        return data
+    
+    data_array = np.array(data)
+    
+    if method == 'moving_avg':
+        # 移动平均平滑
+        kernel = np.ones(window_size) / window_size
+        # 使用'same'模式保持输出长度一致
+        smoothed = np.convolve(data_array, kernel, mode='same')
+        # 处理边界：前后几个点可能不准确，使用原始值
+        half_window = window_size // 2
+        smoothed[:half_window] = data_array[:half_window]
+        smoothed[-half_window:] = data_array[-half_window:]
+        return smoothed.tolist()
+    
+    elif method == 'ema':
+        # 指数移动平均平滑
+        alpha = 2 / (window_size + 1)  # 标准EMA平滑系数
+        smoothed = [data_array[0]]
+        for i in range(1, len(data_array)):
+            smoothed.append(alpha * data_array[i] + (1 - alpha) * smoothed[-1])
+        return smoothed
+    
+    elif method == 'savgol':
+        # Savitzky-Golay滤波器（需要scipy）
+        try:
+            from scipy.signal import savgol_filter
+            # 窗口大小必须是奇数
+            if window_size % 2 == 0:
+                window_size += 1
+            # 多项式阶数必须小于窗口大小
+            polyorder = min(3, window_size - 1)
+            if len(data_array) >= window_size:
+                smoothed = savgol_filter(data_array, window_size, polyorder)
+                return smoothed.tolist()
+            else:
+                return data
+        except ImportError:
+            print("警告: scipy未安装，回退到移动平均方法")
+            return smooth_curve(data, window_size, 'moving_avg')
+    
+    else:
+        return data
+
+
 # ============ 绘图函数 ============
 def plot_training_process(train_losses: List[float], val_losses: List[float],
                           train_maes: List[float], val_maes: List[float],
                           train_rmses: List[float], val_rmses: List[float],
                           model_type: str, save_dir: str = "results",
-                          show: bool = True):
-    """绘制训练过程曲线"""
+                          show: bool = True, smooth: bool = True,
+                          smooth_window: int = 5, smooth_method: str = 'ema'):
+    """
+    绘制训练过程曲线
+    
+    Args:
+        train_losses: 训练损失列表
+        val_losses: 验证损失列表
+        train_maes: 训练MAE列表
+        val_maes: 验证MAE列表
+        train_rmses: 训练RMSE列表
+        val_rmses: 验证RMSE列表
+        model_type: 模型类型名称
+        save_dir: 保存目录
+        show: 是否显示图像
+        smooth: 是否平滑曲线
+        smooth_window: 平滑窗口大小
+        smooth_method: 平滑方法 ('moving_avg', 'ema', 'savgol')
+    """
     os.makedirs(save_dir, exist_ok=True)
+    
+    # 应用平滑
+    if smooth:
+        train_losses = smooth_curve(train_losses, smooth_window, smooth_method)
+        val_losses = smooth_curve(val_losses, smooth_window, smooth_method)
+        train_maes = smooth_curve(train_maes, smooth_window, smooth_method)
+        val_maes = smooth_curve(val_maes, smooth_window, smooth_method)
+        train_rmses = smooth_curve(train_rmses, smooth_window, smooth_method)
+        val_rmses = smooth_curve(val_rmses, smooth_window, smooth_method)
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     

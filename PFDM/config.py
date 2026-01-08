@@ -104,9 +104,9 @@ class TrainingConfig:
     scheduler_patience: int = 30     # 从informer-prv: 20
     
     # 梯度裁剪
-    use_grad_clip: bool = False  # 是否启用梯度裁剪
+    use_grad_clip: bool = True  # 是否启用梯度裁剪（默认启用以提高稳定性）
     max_grad_norm: float = 1.0  # 梯度裁剪最大范数
-    
+        
     # 训练模式
     train_mode: str = "dual_stream"    # 训练模式
     task_type: str = "regression"      # 任务类型: regression/classification/multi_task
@@ -118,8 +118,17 @@ class TrainingConfig:
     seed: int = 42
     
     # 早停配置
-    early_stopping: bool = False
+    early_stopping: bool = False  # 默认启用早停
     early_stopping_patience: int = 50
+        
+    # 余弦退火调度器参数
+    use_cosine_annealing: bool = False  # 是否使用余弦退火调度器（更平滑）
+    cosine_annealing_t0: int = 50  # 余弦退火初始周期
+    cosine_annealing_tmult: int = 1  # 周期倍增因子
+    cosine_annealing_eta_min: float = 1e-6  # 最小学习率
+    
+    # 训练平滑参数
+    smoothing_alpha: float = 0.7  # 指数移动平均平滑系数，越接近1越平滑
 
 
 @dataclass
