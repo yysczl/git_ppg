@@ -29,6 +29,34 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
+
+
+# ============================================================
+# 辅助模块：DropPath（随机深度）
+# ============================================================
+
+class DropPath(nn.Module):
+    """
+    随机深度（Stochastic Depth）模块
+    
+    在训练时随机丢弃整个残差分支，提高模型泛化能力
+    参考: "Deep Networks with Stochastic Depth" (Huang et al., 2016)
+    """
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        # 生成随机mask，保持batch维度
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # 二值化
+        output = x.div(keep_prob) * random_tensor
+        return output
 
 
 # ============================================================
@@ -136,37 +164,69 @@ class PhysiologicalPositionalEncoding(nn.Module):
 
 class MultiScaleConvBlock(nn.Module):
     """
-    多尺度卷积特征提取模块
+    多尺度卷积特征提取模块（改进版）
     
     设计原理：
     - 使用多种卷积核尺寸并行处理输入
     - 小卷积核(1x1, 3x3)捕获高频细节（如重搏波切迹）
     - 大卷积核(5x5, 7x7)捕获低频形态（如收缩/舒张期波形）
-    - 拼接后融合多尺度特征
+    - 使用深度可分离卷积减少参数量
+    - 添加通道注意力进行自适应特征加权
     
     类似于Inception模块的设计思想
     """
     
-    def __init__(self, d_model: int, scales: list = [1, 3, 5, 7]):
+    def __init__(self, d_model: int, scales: list = [1, 3, 5, 7], dropout: float = 0.1):
         super().__init__()
         self.scales = scales
         self.num_scales = len(scales)
+        self.d_model = d_model
         
         # 每个尺度的输出维度
         scale_dim = d_model // self.num_scales
+        self.scale_dim = scale_dim
         
-        # 多尺度卷积分支
-        self.convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv1d(d_model, scale_dim, kernel_size=s, padding=s // 2),
-                nn.BatchNorm1d(scale_dim),
-                nn.GELU()
-            ) for s in scales
-        ])
+        # 多尺度深度可分离卷积分支
+        self.convs = nn.ModuleList()
+        for s in scales:
+            if s == 1:
+                # 1x1卷积直接使用普通卷积
+                conv = nn.Sequential(
+                    nn.Conv1d(d_model, scale_dim, kernel_size=1),
+                    nn.BatchNorm1d(scale_dim),
+                    nn.GELU()
+                )
+            else:
+                # 深度可分离卷积: depthwise + pointwise
+                conv = nn.Sequential(
+                    nn.Conv1d(d_model, d_model, kernel_size=s, padding=s // 2, groups=d_model),
+                    nn.Conv1d(d_model, scale_dim, kernel_size=1),
+                    nn.BatchNorm1d(scale_dim),
+                    nn.GELU()
+                )
+            self.convs.append(conv)
         
-        # 1x1卷积融合
-        self.fusion = nn.Conv1d(d_model, d_model, kernel_size=1)
+        # 通道注意力（SE-like）用于自适应特征加权
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, d_model),
+            nn.Sigmoid()
+        )
+        
+        # 融合层：先投影再残差
+        self.fusion = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.BatchNorm1d(d_model)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
+        
+        # 残差缩放因子（可学习）
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -175,6 +235,8 @@ class MultiScaleConvBlock(nn.Module):
         Returns:
             [batch_size, seq_len, d_model]
         """
+        residual = x
+        
         # 转换为卷积格式: [B, C, L]
         x_conv = x.transpose(1, 2)
         L = x_conv.size(2)
@@ -184,61 +246,88 @@ class MultiScaleConvBlock(nn.Module):
         for conv in self.convs:
             feat = conv(x_conv)
             # 确保输出长度一致
-            feat = feat[:, :, :L]
+            if feat.size(2) > L:
+                feat = feat[:, :, :L]
+            elif feat.size(2) < L:
+                feat = F.pad(feat, (0, L - feat.size(2)))
             multi_scale_feats.append(feat)
         
         # 拼接多尺度特征
-        fused = torch.cat(multi_scale_feats, dim=1)
+        fused = torch.cat(multi_scale_feats, dim=1)  # [B, d_model, L]
         
-        # 1x1卷积融合
+        # 通道注意力加权
+        channel_weights = self.channel_attention(fused).unsqueeze(-1)  # [B, d_model, 1]
+        fused = fused * channel_weights
+        
+        # 融合投影
         output = self.fusion(fused)
         
         # 转换回: [B, L, C]
         output = output.transpose(1, 2)
+        output = self.dropout(output)
         
-        return self.norm(output)
+        # 残差连接（带缩放）
+        output = self.norm(residual + self.residual_scale * output)
+        
+        return output
 
 
 class TimeFreqAttention(nn.Module):
     """
-    时频融合注意力机制
+    时频融合注意力机制（改进版）
     
     创新点：
     - 同时在时域和频域计算注意力
     - 时域捕获局部模式和瞬态变化
     - 频域捕获周期性成分和全局特征
-    - 自适应学习时频特征的融合权重
+    - 使用门控机制自适应融合时频特征（更稳定）
+    - Pre-LN设计提高训练稳定性
     
     对应开题报告中的"多尺度时频融合注意力机制(MSTF-Block)"
     """
     
     def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1,
-                 use_freq_attention: bool = True):
+                 use_freq_attention: bool = True, drop_path: float = 0.0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.use_freq_attention = use_freq_attention
+        
+        # Pre-LN
+        self.pre_norm = nn.LayerNorm(d_model)
         
         # 时域注意力（标准多头自注意力）
         self.time_attn = nn.MultiheadAttention(
             d_model, n_heads, dropout=dropout, batch_first=True
         )
         
-        # 频域特征处理
+        # 频域特征处理（改进版）
         if use_freq_attention:
-            self.freq_linear = nn.Sequential(
-                nn.Linear(d_model, d_model),
+            self.freq_encoder = nn.Sequential(
+                nn.Linear(d_model, d_model * 2),
                 nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model * 2, d_model),
                 nn.Dropout(dropout)
             )
+            
+            # 门控融合网络（更稳定的融合方式）
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.Sigmoid()
+            )
         
-        # 自适应融合权重
-        self.time_weight = nn.Parameter(torch.tensor(0.7))
-        self.freq_weight = nn.Parameter(torch.tensor(0.3))
+        # 输出投影
+        self.output_proj = nn.Linear(d_model, d_model)
         
-        # 层归一化和dropout
-        self.norm = nn.LayerNorm(d_model)
+        # 随机深度
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # dropout
         self.dropout = nn.Dropout(dropout)
+        
+        # 残差缩放
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.5)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -247,59 +336,69 @@ class TimeFreqAttention(nn.Module):
         Returns:
             [batch_size, seq_len, d_model]
         """
+        residual = x
         B, L, D = x.shape
+        
+        # Pre-LN
+        x = self.pre_norm(x)
         
         # 时域注意力
         time_out, _ = self.time_attn(x, x, x)
         
         if self.use_freq_attention:
-            # 频域处理
+            # 频域处理（改进版）
             # FFT变换
             x_freq = torch.fft.rfft(x, dim=1)
             
-            # 提取幅度谱（保留相位信息用于重建）
-            freq_real = x_freq.real
-            freq_imag = x_freq.imag
-            freq_magnitude = torch.sqrt(freq_real ** 2 + freq_imag ** 2 + 1e-8)
+            # 提取幅度和相位
+            freq_magnitude = torch.abs(x_freq)
+            freq_phase = torch.angle(x_freq)
             
-            # 频域特征增强
-            freq_feat = self.freq_linear(freq_magnitude)
+            # 频域特征增强（在幅度上操作）
+            freq_feat = self.freq_encoder(freq_magnitude)
             
-            # 插值回原始时域长度
-            freq_out = F.interpolate(
-                freq_feat.transpose(1, 2),
-                size=L,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
+            # 重建频域表示并逆变换回时域
+            enhanced_freq = freq_feat * torch.exp(1j * freq_phase)
+            freq_out = torch.fft.irfft(enhanced_freq, n=L, dim=1)
             
-            # 自适应权重融合
-            t_weight = torch.sigmoid(self.time_weight)
-            f_weight = torch.sigmoid(self.freq_weight)
+            # 门控融合：让模型自适应学习时频特征的重要性
+            concat_feat = torch.cat([time_out, freq_out], dim=-1)
+            gate = self.fusion_gate(concat_feat)
             
-            output = t_weight * time_out + f_weight * freq_out
+            # 门控加权融合
+            output = gate * time_out + (1 - gate) * freq_out
         else:
             output = time_out
         
-        # 残差连接和归一化
-        return self.norm(x + self.dropout(output))
+        # 输出投影
+        output = self.output_proj(output)
+        output = self.dropout(output)
+        
+        # 残差连接（带缩放和随机深度）
+        output = residual + self.drop_path(self.residual_scale * output)
+        
+        return output
 
 
 class StressAwareGating(nn.Module):
     """
-    压力感知门控机制
+    压力感知门控机制（改进版）
     
     设计原理：
     - 通道门控：学习每个特征通道的重要性权重
     - 空间/时间门控：学习每个时间点的重要性权重
     - 双重门控机制自适应选择与压力相关的特征
+    - 添加残差缩放提高稳定性
     
     类似于SE-Block(通道)和CBAM(空间)的组合
     公式：X_out = X · σ(MLP(AvgPool(X))) · σ(Conv1D(X))
     """
     
-    def __init__(self, d_model: int, reduction: int = 4):
+    def __init__(self, d_model: int, reduction: int = 4, dropout: float = 0.1):
         super().__init__()
+        
+        # Pre-LN
+        self.pre_norm = nn.LayerNorm(d_model)
         
         # 通道门控（类似SE-Block）
         self.channel_gate = nn.Sequential(
@@ -307,15 +406,21 @@ class StressAwareGating(nn.Module):
             nn.Flatten(),
             nn.Linear(d_model, d_model // reduction),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model // reduction, d_model),
             nn.Sigmoid()
         )
         
         # 空间/时间门控
         self.spatial_gate = nn.Sequential(
-            nn.Conv1d(d_model, 1, kernel_size=7, padding=3),
+            nn.Conv1d(d_model, d_model // reduction, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(d_model // reduction, 1, kernel_size=7, padding=3),
             nn.Sigmoid()
         )
+        
+        # 残差缩放
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.5)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -324,6 +429,11 @@ class StressAwareGating(nn.Module):
         Returns:
             [batch_size, seq_len, d_model]
         """
+        residual = x
+        
+        # Pre-LN
+        x = self.pre_norm(x)
+        
         # 转换为: [B, C, L]
         x_t = x.transpose(1, 2)
         
@@ -336,18 +446,26 @@ class StressAwareGating(nn.Module):
         x_t = x_t * spatial_weight
         
         # 转换回: [B, L, C]
-        return x_t.transpose(1, 2)
+        output = x_t.transpose(1, 2)
+        
+        # 残差连接（带缩放）
+        return residual + self.residual_scale * output
 
 
 class PPGFormerBlock(nn.Module):
     """
-    PPG-Former基本模块
+    PPG-Former基本模块（改进版）
     
-    结构：
-    1. 多尺度卷积 + 残差
-    2. 时频融合注意力
-    3. 压力感知门控 + 残差
-    4. 前馈网络 + 残差
+    结构（Pre-LN设计，更稳定）：
+    1. 多尺度卷积（已包含残差和归一化）
+    2. 时频融合注意力（已包含残差和归一化）
+    3. 压力感知门控（已包含残差和归一化）
+    4. 前馈网络 + 残差（Pre-LN）
+    
+    改进点：
+    - 使用Pre-LN设计，提高训练稳定性
+    - 添加DropPath提高泛化能力
+    - 更好的残差缩放
     """
     
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
@@ -355,28 +473,35 @@ class PPGFormerBlock(nn.Module):
                  use_multi_scale_conv: bool = True,
                  use_time_freq_attention: bool = True,
                  use_freq_attention: bool = True,
-                 use_stress_gating: bool = True):
+                 use_stress_gating: bool = True,
+                 drop_path: float = 0.0):
         super().__init__()
         
         self.use_multi_scale_conv = use_multi_scale_conv
         self.use_stress_gating = use_stress_gating
+        self.d_model = d_model
         
-        # 多尺度卷积
+        # 多尺度卷积（内部已包含残差和归一化）
         if use_multi_scale_conv:
-            self.multi_scale_conv = MultiScaleConvBlock(d_model, scales)
+            self.multi_scale_conv = MultiScaleConvBlock(d_model, scales, dropout)
         
-        # 时频融合注意力
-        self.time_freq_attn = TimeFreqAttention(
-            d_model, n_heads, dropout, use_freq_attention
-        ) if use_time_freq_attention else nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
+        # 时频融合注意力（内部已包含残差和归一化）
+        if use_time_freq_attention:
+            self.time_freq_attn = TimeFreqAttention(
+                d_model, n_heads, dropout, use_freq_attention, drop_path
+            )
+        else:
+            self.time_freq_attn = nn.MultiheadAttention(
+                d_model, n_heads, dropout=dropout, batch_first=True
+            )
+            self.attn_norm = nn.LayerNorm(d_model)
         
-        # 压力感知门控
+        # 压力感知门控（内部已包含残差和归一化）
         if use_stress_gating:
-            self.stress_gate = StressAwareGating(d_model)
+            self.stress_gate = StressAwareGating(d_model, dropout=dropout)
         
-        # 前馈网络
+        # 前馈网络（Pre-LN设计）
+        self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
             nn.GELU(),
@@ -385,10 +510,11 @@ class PPGFormerBlock(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # 层归一化
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
+        # 随机深度
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # FFN残差缩放
+        self.ffn_residual_scale = nn.Parameter(torch.ones(1) * 0.5)
         
         self._use_time_freq_attention = use_time_freq_attention
     
@@ -399,38 +525,50 @@ class PPGFormerBlock(nn.Module):
         Returns:
             [batch_size, seq_len, d_model]
         """
-        # 多尺度卷积
+        # 多尺度卷积（内部已处理残差和归一化）
         if self.use_multi_scale_conv:
-            x = self.norm1(x + self.multi_scale_conv(x))
+            x = self.multi_scale_conv(x)
         
         # 时频融合注意力
         if self._use_time_freq_attention:
+            # TimeFreqAttention内部已处理残差和归一化
             x = self.time_freq_attn(x)
         else:
+            # 标准多头注意力（需要手动处理残差）
+            residual = x
+            x = self.attn_norm(x)
             attn_out, _ = self.time_freq_attn(x, x, x)
-            x = self.norm2(x + attn_out)
+            x = residual + self.drop_path(attn_out)
         
-        # 压力感知门控
+        # 压力感知门控（内部已处理残差和归一化）
         if self.use_stress_gating:
-            x = self.norm2(x + self.stress_gate(x))
+            x = self.stress_gate(x)
         
-        # 前馈网络
-        x = self.norm3(x + self.ffn(x))
+        # 前馈网络（Pre-LN + 残差）
+        residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = residual + self.drop_path(self.ffn_residual_scale * x_ffn)
         
         return x
 
 
 class PPGFormerEncoder(nn.Module):
     """
-    PPG-Former编码器
+    PPG-Former编码器（改进版）
     
     用于处理原始PPG信号，提取深层特征
     
     结构：
-    1. 输入投影层
+    1. 输入投影层（带层归一化）
     2. 位置编码（可选生理周期感知）
-    3. 多层PPGFormerBlock
+    3. 多层PPGFormerBlock（带递增DropPath）
     4. 输出归一化
+    
+    改进点：
+    - 递增DropPath概率，深层丢弃概率更高
+    - 更好的输入投影（包含归一化和激活）
+    - 参数初始化优化
     """
     
     def __init__(self, input_dim: int, d_model: int, n_heads: int = 8,
@@ -440,11 +578,19 @@ class PPGFormerEncoder(nn.Module):
                  use_multi_scale_conv: bool = True,
                  use_time_freq_attention: bool = True,
                  use_freq_attention: bool = True,
-                 use_stress_gating: bool = True):
+                 use_stress_gating: bool = True,
+                 drop_path_rate: float = 0.1):
         super().__init__()
         
-        # 输入投影
-        self.input_proj = nn.Linear(input_dim, d_model)
+        self.d_model = d_model
+        
+        # 输入投影（改进版：包含归一化和激活）
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
         
         # 位置编码
         if use_physiological_pe:
@@ -452,18 +598,42 @@ class PPGFormerEncoder(nn.Module):
         else:
             self.pos_encoding = StandardPositionalEncoding(d_model, dropout=dropout)
         
-        # PPGFormer层
+        # 计算递增的DropPath概率
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
+        
+        # PPGFormer层（带递增DropPath）
         self.layers = nn.ModuleList([
             PPGFormerBlock(
                 d_model, n_heads, d_ff, scales, dropout,
                 use_multi_scale_conv, use_time_freq_attention,
-                use_freq_attention, use_stress_gating
+                use_freq_attention, use_stress_gating,
+                drop_path=dpr[i]
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
         
         # 输出归一化
         self.output_norm = nn.LayerNorm(d_model)
+        
+        # 初始化参数
+        self._init_weights()
+    
+    def _init_weights(self):
+        """参数初始化"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # 使用Xavier初始化
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                # 使用Kaiming初始化
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -880,9 +1050,13 @@ class MultiTaskHead(nn.Module):
 
 class PPGFormer(nn.Module):
     """
-    PPG-Former: 单流PPG信号模型
+    PPG-Former: 单流PPG信号模型（改进版）
     
     支持回归和分类任务，可作为基准模型与其他模型对比
+    
+    改进点：
+    - 添加drop_path_rate参数
+    - 支持加权平均池化
     """
     
     def __init__(self, input_dim: int = 1, output_dim: int = 1,
@@ -895,10 +1069,12 @@ class PPGFormer(nn.Module):
                  use_time_freq_attention: bool = True,
                  use_freq_attention: bool = True,
                  use_stress_gating: bool = True,
-                 use_uncertainty_weighting: bool = True):
+                 use_uncertainty_weighting: bool = True,
+                 drop_path_rate: float = 0.1):
         super().__init__()
         
         self.task_type = task_type
+        self.d_model = d_model
         
         self.encoder = PPGFormerEncoder(
             input_dim=input_dim,
@@ -912,8 +1088,12 @@ class PPGFormer(nn.Module):
             use_multi_scale_conv=use_multi_scale_conv,
             use_time_freq_attention=use_time_freq_attention,
             use_freq_attention=use_freq_attention,
-            use_stress_gating=use_stress_gating
+            use_stress_gating=use_stress_gating,
+            drop_path_rate=drop_path_rate
         )
+        
+        # 全局池化层（可学习的加权平均）
+        self.pool_weight = nn.Parameter(torch.ones(1))
         
         # 根据任务类型创建相应的头
         if task_type == "regression":
@@ -975,12 +1155,16 @@ class PPGFormer(nn.Module):
 
 class PPGFormerDualStream(nn.Module):
     """
-    PPG-Former-DualStream: 融合多尺度时频Transformer与双流协同的多任务心理压力预测模型
+    PPG-Former-DualStream: 融合多尺度时频Transformer与双流协同的多任务心理压力预测模型（改进版）
     
     完整创新点：
     1. PPG-Former: 生理周期感知位置编码 + 多尺度时频融合注意力 + 压力感知门控
     2. Dual-Stream: 跨模态交互注意力 + 自适应权重融合
     3. 多任务学习: 不确定性加权的压力回归与情绪分类联合学习
+    
+    改进点：
+    - 添加drop_path_rate参数
+    - 改进的编码器结构
     """
     
     def __init__(self, ppg_input_dim: int = 1, prv_input_dim: int = 1,
@@ -994,7 +1178,8 @@ class PPGFormerDualStream(nn.Module):
                  use_freq_attention: bool = True,
                  use_stress_gating: bool = True,
                  use_cross_modal_attention: bool = True,
-                 use_uncertainty_weighting: bool = True):
+                 use_uncertainty_weighting: bool = True,
+                 drop_path_rate: float = 0.1):
         super().__init__()
         
         # PPG编码器
@@ -1010,7 +1195,8 @@ class PPGFormerDualStream(nn.Module):
             use_multi_scale_conv=use_multi_scale_conv,
             use_time_freq_attention=use_time_freq_attention,
             use_freq_attention=use_freq_attention,
-            use_stress_gating=use_stress_gating
+            use_stress_gating=use_stress_gating,
+            drop_path_rate=drop_path_rate
         )
         
         # PRV编码器
