@@ -873,8 +873,13 @@ def plot_predictions(predictions: List[float], targets: List[float],
     mae = np.mean(np.abs(predictions - targets))
     rmse = np.sqrt(np.mean((predictions - targets) ** 2))
     correlation = np.corrcoef(predictions, targets)[0, 1]
+    
+    # 计算R²
+    ss_res = np.sum((targets - predictions) ** 2)
+    ss_tot = np.sum((targets - np.mean(targets)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
-    text = f'MAE: {mae:.4f}\nRMSE: {rmse:.4f}\nCorr: {correlation:.4f}'
+    text = f'MAE: {mae:.4f}\nRMSE: {rmse:.4f}\nR²: {r2:.4f}\nCorr: {correlation:.4f}'
     ax.text(0.05, 0.95, text, transform=ax.transAxes, fontsize=10,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
